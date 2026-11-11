@@ -1,0 +1,6 @@
+{
+  "name": "plan-board",
+  "version": "0.1.0",
+  "description": "Живой прогресс плана claude-planner и его воркеров: полоса над строкой ввода, панель /plan-board и строка статуса",
+  "types": "./types/index.d.ts"
+}
