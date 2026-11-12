@@ -84,6 +84,40 @@ class Hooks(ProjectCase):
         self.assertEqual(hook("agent_gate", {"tool_name": "mcp__planner__plan_finish", "agent_id": "a1"},
                               {"CPLAN_AGENT_GATE": "0"}), {})
 
+    def test_edit_in_project_needs_open_plan(self):
+        edit = lambda path, **kw: hook("plan_gate", {"session_id": "s7", "tool_name": "Edit",  # noqa: E731
+                                                     "tool_input": {"file_path": path}, **kw})
+        target = os.path.join(self.dir, "pkg", "new.py")
+        out = edit(target)["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn(f'plan_init(project_dir="{self.dir}"', out["permissionDecisionReason"])
+        self.assertIn("один пункт", out["permissionDecisionReason"])  # лёгкий план — тоже план
+        sub = edit(target, agent_id="a1")["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("основная сессия", sub)
+        self.assertNotIn("plan_init", sub)
+        self.assertEqual(edit("a.py", cwd=self.dir)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(hook("plan_gate", {"tool_name": "Edit", "tool_input": {"file_path": target}},
+                              {"CPLAN_PLAN_GATE": "0"}), {})
+        core.init(self.dir, "План", "цель плана достаточно длинная", [item()])
+        self.assertEqual(edit(target), {})  # открытый план накрывает весь проект, а не только файлы пунктов
+        self.assertEqual(edit(target, agent_id="a1"), {})
+        self.write("out.txt", "x")
+        core.verify_items(self.dir, ["1"])
+        core.finish(self.dir, "готово, проверки прошли")
+        self.assertEqual(edit(target)["hookSpecificOutput"]["permissionDecision"], "deny")  # план закрыт — нужен новый
+
+    def test_plan_gate_leaves_non_project_files_alone(self):
+        edit = lambda path, env=None: hook("plan_gate", {"tool_name": "Write", "tool_input": {"file_path": path}}, env)  # noqa: E731
+        self.assertEqual(edit(os.path.join(self.home, "notes.txt")), {})  # файл вне проектов
+        self.assertEqual(edit(os.path.join(self.home, ".claude", "projects", "x", "memory", "m.md")), {})
+        self.assertEqual(edit(os.path.join(self.dir, ".cplan", "notes.md")), {})
+        self.assertEqual(edit(os.path.join(self.dir, ".claude", "settings.json")), {})
+        self.assertEqual(edit(os.path.join(ROOT, "planner", "core.py")), {})  # сам планер правят напрямую
+        base = os.path.join(self.home, "projects")
+        fresh = edit(os.path.join(base, "fresh", "src", "main.py"))["hookSpecificOutput"]  # новый проект без git
+        self.assertIn(f'project_dir="{os.path.realpath(base)}/fresh"', fresh["permissionDecisionReason"])
+        self.assertEqual(edit(os.path.join(base, "scratch.py")), {})  # не внутри проекта
+
     def test_nudge_once_after_several_files_without_plan(self):
         outs = [hook("track", {"session_id": "s3", "tool_name": "Edit",
                                "tool_input": {"file_path": os.path.join(self.dir, f"f{n}.py")}}) for n in range(6)]

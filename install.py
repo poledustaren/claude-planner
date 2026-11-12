@@ -32,7 +32,7 @@ MOD = os.path.join(REPO, "mod", "plan-board")
 MOD_ENV = "CLAUDE_CODE_PLUGIN_DIRS"
 CONTEXT_WINDOW = 300_000  # автокомпактация основной сессии; встроенные субагенты наследуют. Состояние плана
                           # переживает сжатие (plan_show), поэтому миллионное окно с планером не нужно
-HOOK_MODES = ("read_cap", "agent_gate", "track", "prompt", "stop", "subagent")
+HOOK_MODES = ("read_cap", "agent_gate", "plan_gate", "track", "prompt", "stop", "subagent")
 PRUNE_GLOBS = ("skills/gsd-*", "agents/gsd-*.md", "get-shit-done", "skills/tool-recall", "skills/skill-selector",
                "skills/learned", "skills/orchestrator")
 MANUAL_ONLY = ("skills/model-router/SKILL.md",)  # остаётся по /имя, но сам в контекст не лезет
@@ -89,6 +89,7 @@ def hook_entries() -> list[tuple[str, dict]]:
         return {"type": "command", "command": f"{PY} {HOOKS} {mode}", "timeout": 5}
     return [("PreToolUse", {"matcher": "Read", "hooks": [cmd("read_cap")]}),
             ("PreToolUse", {"matcher": "mcp__planner__.*", "hooks": [cmd("agent_gate")]}),
+            ("PreToolUse", {"matcher": "Edit|Write|MultiEdit|NotebookEdit", "hooks": [cmd("plan_gate")]}),
             ("PostToolUse", {"matcher": "mcp__planner__.*|Edit|Write", "hooks": [cmd("track")]}),
             ("UserPromptSubmit", {"hooks": [cmd("prompt")]}),
             ("Stop", {"hooks": [cmd("stop")]}),

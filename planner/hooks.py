@@ -4,6 +4,7 @@
   read_cap  PreToolUse(Read)            — не читать большой файл кода целиком
   subagent  SubagentStart               — встроенный субагент получает действующий план и правила работы в нём
   agent_gate PreToolUse(planner)        — субагент план не меняет и пункты не закрывает: это делает основная сессия
+  plan_gate PreToolUse(Edit|Write…)     — правка файла проекта только при открытом плане; вес плана выбирает модель
   track     PostToolUse(planner|Edit…)  — помнить, какие планы ведёт сессия; разовая подсказка про план
   prompt    UserPromptSubmit            — новый ход пользователя: сбросить счётчики
   stop      Stop                        — не бросать план, который вели в этом ходу
@@ -30,6 +31,9 @@ AGENT_GATE = (os.environ.get("CPLAN_AGENT_GATE", "1") or "0") != "0"
 OWNER_TOOLS = ("plan_init", "plan_update", "plan_skip", "plan_finish", "plan_run", "plan_verify", "plan_review",
                "plan_worker", "wiki_publish")  # читать план (plan_show, plan_jobs, plan_scout, wiki_pages) субагенту можно
 BRIEF_CAP = 4000
+PLAN_GATE = (os.environ.get("CPLAN_PLAN_GATE", "1") or "0") != "0"
+PROJECT_DIRS = (os.environ.get("CPLAN_PROJECT_DIRS") or "~/projects:~/work:/mnt/datadisk/Projects").split(":")
+SELF = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))  # планер правят напрямую: сам себя он не гейтит
 
 
 def state_path(session_id: str) -> str:
@@ -182,6 +186,62 @@ def agent_gate(data: dict) -> dict:
                                    "permissionDecisionReason": reason}}
 
 
+# ───────────────────────── plan_gate ─────────────────────────
+
+def open_plan(path: str) -> str | None:
+    """Папка с незакрытым планом, который накрывает файл."""
+    cur = os.path.dirname(path)
+    home = os.path.realpath(os.path.expanduser("~"))
+    while cur and cur not in ("/", home):
+        plan = read_plan(cur)
+        if plan and plan.get("status") != "finished":
+            return cur
+        cur = os.path.dirname(cur)
+    return None
+
+
+def project_root(path: str) -> str | None:
+    """Проект файла: git-репозиторий, папка с планом или папка первого уровня в каталогах проектов."""
+    root = git_root(path) or plan_root(path)
+    if root:
+        return root
+    for base in PROJECT_DIRS:
+        base = os.path.realpath(os.path.expanduser(base)) if base else ""
+        if base and path.startswith(base + os.sep):
+            rest = path[len(base) + 1:].split(os.sep)
+            return os.path.join(base, rest[0]) if len(rest) > 1 else None
+    return None
+
+
+def plan_gate(data: dict) -> dict:
+    inp = data.get("tool_input") or {}
+    path = inp.get("file_path") or inp.get("notebook_path")
+    if not PLAN_GATE or not isinstance(path, str) or not path:
+        return {}
+    path = os.path.realpath(os.path.join(str(data.get("cwd") or ""), os.path.expanduser(path)))
+    own = os.path.join(os.path.realpath(os.path.expanduser("~")), ".claude") + os.sep  # память, настройки, скиллы
+    if path.startswith((own, SELF + os.sep)) or "/.cplan/" in path:
+        return {}
+    if "/.claude/" in path and "/.claude/worktrees/" not in path:
+        return {}
+    root = project_root(path)
+    if not root or open_plan(path):
+        return {}
+    name = os.path.basename(path)
+    if data.get("agent_id"):
+        reason = (f"{name}: в {root} нет открытого плана, а правки в проекте идут только по плану. План заводит "
+                  "основная сессия: остановись и верни ей отчёт — что и в каких файлах нужно изменить (file:line).")
+    else:
+        reason = (f"{name}: правка без плана. В проекте правки идут только по плану — это решает хук, а не размер "
+                  f"задачи. Заведи план: скилл planner → plan_init(project_dir=\"{root}\", title, goal, items). Вес "
+                  "выбираешь ты и меняешь по ходу: мелочь — один пункт tier \"main\" с проверкой, делаешь сам; работы "
+                  "больше — независимые пункты воркерам (code-low / code / code-high), незнакомый код — сначала "
+                  "plan_scout; выросла задача — plan_update(add=[...]). Инструментов planner в сессии нет — скажи "
+                  "пользователю. Через Bash запрет не обходи.")
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                   "permissionDecisionReason": reason}}
+
+
 # ───────────────────────── track / prompt ─────────────────────────
 
 def track(data: dict) -> dict:
@@ -276,7 +336,7 @@ def stop(data: dict) -> dict:
 
 
 MODES = {"read_cap": read_cap, "track": track, "prompt": prompt, "stop": stop, "subagent": subagent,
-         "agent_gate": agent_gate}
+         "agent_gate": agent_gate, "plan_gate": plan_gate}
 
 
 def main(argv: list[str]) -> int:

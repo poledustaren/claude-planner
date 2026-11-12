@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from planner import core, flow  # noqa: E402
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DIRP = {"type": "string", "description": "Абсолютный путь к папке проекта"}
 IDS = {"type": "array", "items": {"type": "string"}}
 ITEM = {
