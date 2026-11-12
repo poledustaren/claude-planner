@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import time
 
-from . import core, outline, plane, workers
+from . import core, hub, outline, plane, workers
 
 REPORT_CAP = 3500
 WIKI_TEXT_CAP = 6000
@@ -69,6 +69,7 @@ def next_hint(root: str, plan: dict) -> str:
 
 def _tail(root: str, extra: str = "") -> str:
     plan = core.load(root)
+    hub.notify(plan)
     return "\n".join(x for x in (extra, "План: " + core.status_line(plan), next_hint(root, plan)) if x)
 
 
@@ -626,6 +627,7 @@ def finish(project_dir: str, summary: str, user_approval: str | None = None, for
     elif live:
         raise core.PlanError(f"Ещё работают воркеры ({len(live)}). Дождись plan_jobs(wait=true, mode=\"all\") или останови.")
     plan = core.finish(root, summary, user_approval, force)
+    hub.notify(plan)
     for job in workers.list_jobs(root):
         workers.cleanup_session(job)
     cost = sum(workers.view(j)["cost"] for j in workers.list_jobs(root))
