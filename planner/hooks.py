@@ -213,6 +213,53 @@ def project_root(path: str) -> str | None:
     return None
 
 
+def wrong_branch(root: str, path: str) -> str | None:
+    """План привязан к ветке: в другой ветке того же рабочего дерева править нельзя (отдельный worktree — можно)."""
+    plan = read_plan(root) or {}
+    want = plan.get("branch")
+    if not want or git_root(path) != root:
+        return None
+    try:
+        with open(os.path.join(root, ".git", "HEAD"), encoding="utf-8") as fh:
+            head = fh.read().strip()
+    except OSError:
+        return None
+    cur = head[len("ref: refs/heads/"):] if head.startswith("ref: refs/heads/") else None
+    if not cur or cur == want:
+        return None
+    return (f"план «{plan.get('title')}» ведётся в ветке {want}, а сейчас {cur}. Вернись: git switch {want} — либо "
+            f"перенеси план в эту ветку: plan_update(branch=\"{cur}\").")
+
+
+def light_budget(root: str, path: str) -> str | None:
+    """План из одних пунктов без проверки — чеклист: один файл кода на пункт, дальше нужен пункт с verify."""
+    plan = read_plan(root) or {}
+    items = plan.get("items") or []
+    if not items or any(not i.get("light") for i in items) or os.path.splitext(path)[1].lower() not in CODE_EXT:
+        return None
+    book = os.path.join(root, ".cplan", "light_files.json")
+    try:
+        with open(book, encoding="utf-8") as fh:
+            st = json.load(fh)
+    except (OSError, ValueError):
+        st = {}
+    if st.get("plan") != plan.get("created_at"):
+        st = {"plan": plan.get("created_at"), "files": []}
+    if path in st["files"]:
+        return None
+    if len(st["files"]) >= len(items):
+        return (f"в плане только пункты без проверки ({len(items)}), а это уже {len(st['files']) + 1}-й файл кода. "
+                "Пункт без проверки — один файл кода. Задача выросла: добавь пункт с проверкой "
+                "plan_update(add=[{title, acceptance, verify, files}]) или дай проверку имеющемуся "
+                "plan_update(update=[{id, verify: [...]}]) — после этого правь дальше.")
+    st["files"].append(path)
+    tmp = f"{book}.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(st, fh, ensure_ascii=False)
+    os.replace(tmp, book)
+    return None
+
+
 def plan_gate(data: dict) -> dict:
     inp = data.get("tool_input") or {}
     path = inp.get("file_path") or inp.get("notebook_path")
@@ -225,17 +272,26 @@ def plan_gate(data: dict) -> dict:
     if "/.claude/" in path and "/.claude/worktrees/" not in path:
         return {}
     root = project_root(path)
-    if not root or open_plan(path):
-        return {}
+    covered = open_plan(path)
     name = os.path.basename(path)
+    if covered:
+        over = wrong_branch(covered, path) or light_budget(covered, path)
+        if not over:
+            return {}
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": f"{name}: {over}"}}
+    if not root:
+        return {}
     if data.get("agent_id"):
         reason = (f"{name}: в {root} нет открытого плана, а правки в проекте идут только по плану. План заводит "
                   "основная сессия: остановись и верни ей отчёт — что и в каких файлах нужно изменить (file:line).")
     else:
         reason = (f"{name}: правка без плана. В проекте правки идут только по плану — это решает хук, а не размер "
                   f"задачи. Заведи план: скилл planner → plan_init(project_dir=\"{root}\", title, goal, items). Вес "
-                  "выбираешь ты и меняешь по ходу: мелочь — один пункт tier \"main\" с проверкой, делаешь сам; работы "
-                  "больше — независимые пункты воркерам (code-low / code / code-high), незнакомый код — сначала "
+                  "выбираешь ты и меняешь по ходу: мелочь в одном файле, отладка, эксперимент, не код — пункт без проверки "
+                  "{title, light: trivial|debug|spike|nocode|followup}, закрывается plan_verify(note); работа с "
+                  "наблюдаемым результатом — пункт tier \"main\" с verify, делаешь сам; работы "
+                  "больше — независимые пункты воркерам (code-mini — механика на Haiku / code-low / code / code-high), незнакомый код — сначала "
                   "plan_scout; выросла задача — plan_update(add=[...]). Инструментов planner в сессии нет — скажи "
                   "пользователю. Через Bash запрет не обходи.")
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
@@ -321,7 +377,7 @@ def stop(data: dict) -> dict:
             if rejected < 3:
                 reasons.append(f"{root}: все пункты закрыты, не пройдена приёмка — plan_review().")
         elif plan.get("status") == "docs_pending":
-            reasons.append(f"{root}: работа принята, документация не опубликована — wiki_pages → wiki_publish.")
+            reasons.append(f"{root}: работа принята, документация не опубликована — wiki_publish(title, notes): страницу напишет воркер.")
         elif plan.get("status") == "ready":
             reasons.append(f"{root}: всё проверено, план не закрыт — plan_finish(summary).")
     if not reasons:

@@ -21,9 +21,10 @@ from concurrent.futures import ThreadPoolExecutor
 DIR = ".cplan"
 CLOSED = ("done", "skipped")
 OPEN = ("todo", "in_progress", "failed")
-WORKER_TIERS = ("code-low", "code", "code-high")
+WORKER_TIERS = ("code-mini", "code-low", "code", "code-high")
+ESCALATE = {"code-mini": "code-low"}  # младшая модель не прошла проверки — пункт сам уходит ярусом выше
 TIERS = ("main",) + WORKER_TIERS
-TIER_ALIASES = {"low": "code-low", "mid": "code", "medium": "code", "high": "code-high",
+TIER_ALIASES = {"mini": "code-mini", "haiku": "code-mini", "low": "code-low", "mid": "code", "medium": "code", "high": "code-high",
                 "sonnet": "code", "self": "main", "orchestrator": "main"}
 REVIEW_MIN = 4          # план от стольких пунктов по умолчанию идёт через приёмку и в трекер
 MAX_REVIEW_ROUNDS = 3   # дальше — только решение пользователя
@@ -32,6 +33,8 @@ DEFAULT_TIMEOUT = 300
 MAX_TIMEOUT = 3600
 HTTP_TIMEOUT = 20
 TAIL = 1500
+LIGHT = {"debug": "отладка", "spike": "эксперимент", "nocode": "не код", "trivial": "мелкая правка",
+         "followup": "доделка"}  # пункты без проверки: закрываются записью «что сделал», а не прогоном verify
 BOX = {"done": "[x]", "todo": "[ ]", "in_progress": "[~]", "failed": "[!]", "skipped": "[-]"}
 CODE_EXT = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".cs", ".go", ".rs", ".java", ".kt",
             ".gd", ".php", ".rb", ".c", ".cc", ".cpp", ".h", ".hpp", ".swift", ".vue", ".svelte",
@@ -151,7 +154,12 @@ def needs_review(plan: dict) -> bool:
     flag = plan.get("review_mode", "auto")
     if flag in (True, False):
         return flag
-    return len(plan["items"]) >= REVIEW_MIN
+    return len(heavy(plan)) >= REVIEW_MIN
+
+
+def heavy(plan: dict) -> list:
+    """Пункты с проверкой. План из одних light-пунктов — чеклист: без приёмки, вики и задачи в трекере."""
+    return [i for i in plan["items"] if not i.get("light")]
 
 
 def last_closed_at(plan: dict) -> str:
@@ -173,24 +181,29 @@ def review_stuck(plan: dict) -> bool:
 
 
 def docs_policy() -> str:
-    """always — вики обязательна для каждого плана (по умолчанию); big — от 4 пунктов; off — выключена."""
+    """big — вики обязательна от 4 пунктов с проверкой (по умолчанию); always — для каждого плана; off — выключена.
+
+    Режим конкретного плана перекрывает политику: docs=true в plan_init — меняется запуск, контракт или схема;
+    docs=false — багфикс или рефакторинг без смены поведения."""
     try:
         with open(os.path.expanduser("~/.config/claude-planner/config.json"), encoding="utf-8") as fh:
             value = json.load(fh).get("docs")
     except (OSError, ValueError):
         value = None
-    return value if value in ("always", "big", "off") else "always"
+    return value if value in ("always", "big", "off") else "big"
 
 
 def needs_docs(plan: dict) -> bool:
     flag = (plan.get("docs") or {}).get("mode", "auto")
     if flag in (True, False):
         return flag
+    if not heavy(plan):
+        return False
     from . import outline  # вики не настроена — гейта нет, план не должен упираться в недоступный сервис
     if outline.connect() is None:
         return False
     policy = docs_policy()
-    return policy == "always" or (policy == "big" and len(plan["items"]) >= REVIEW_MIN)
+    return policy == "always" or (policy == "big" and len(heavy(plan)) >= REVIEW_MIN)
 
 
 def docs_published(plan: dict) -> list:
@@ -292,7 +305,8 @@ def normalize_tier(value, where: str) -> str:
     tier = TIER_ALIASES.get(str(value).strip().lower(), str(value).strip().lower())
     if tier not in TIERS:
         raise PlanError(f"{where}: tier {value!r} не существует. Допустимо: {', '.join(TIERS)} "
-                        "(main — делает оркестратор; code-low/code/code-high — воркер Sonnet с effort low/medium/high). "
+                        "(main — делает оркестратор; code-mini — воркер Haiku для механики; code-low/code/code-high — воркер "
+                        "Sonnet с effort low/medium/high). "
                         "Разведка — не пункт плана, а plan_scout до планирования.")
     return tier
 
@@ -332,23 +346,34 @@ def build_item(raw, item_id: str, root: str) -> dict:
     if not isinstance(title, str) or len(title.strip()) < 3:
         raise PlanError(f"{where}: нужен title (что сделать, одной строкой).")
     where = f"Пункт {item_id} «{title.strip()[:40]}»"
-    acceptance = raw.get("acceptance")
-    if not isinstance(acceptance, str) or len(acceptance.strip()) < 10:
+    light = str(raw.get("light") or "").strip().lower() or None
+    if light:
+        light = {v: k for k, v in LIGHT.items()}.get(light, light)
+        if light not in LIGHT:
+            raise PlanError(f"{where}: light — один из " + ", ".join(f"{k} ({v})" for k, v in LIGHT.items()) + ".")
+    acceptance = raw.get("acceptance") or (title if light else None)
+    if not isinstance(acceptance, str) or len(acceptance.strip()) < (3 if light else 10):
         raise PlanError(f"{where}: нужен acceptance — наблюдаемый результат (≥ 10 символов), а не «сделано».")
     verify = raw.get("verify")
     if isinstance(verify, (str, dict)):
         verify = [verify]
-    if not isinstance(verify, list) or not verify:
-        raise PlanError(f"{where}: нужен verify — хотя бы одна детерминированная проверка.")
-    checks = [normalize_check(c, f"{where}, verify[{n}]") for n, c in enumerate(verify, 1)]
-    tier = normalize_tier(raw.get("tier", raw.get("assignee")), where)
+    if light and verify:
+        raise PlanError(f"{where}: пункт light закрывается записью, verify ему не нужен. Есть проверка — убери light.")
+    if not light and (not isinstance(verify, list) or not verify):
+        raise PlanError(f"{where}: нужен verify — хотя бы одна детерминированная проверка. Без проверки бывают "
+                        f"только пункты light ({', '.join(LIGHT)}): отладка, эксперимент, не код, мелкая правка "
+                        "в одном файле, доделка.")
+    checks = [normalize_check(c, f"{where}, verify[{n}]") for n, c in enumerate(verify or [], 1)]
+    tier = normalize_tier(raw.get("tier", raw.get("assignee")) or ("main" if light else None), where)
+    if light and tier != "main":
+        raise PlanError(f"{where}: пункт light делает основная сессия (tier main). Воркеру нужна проверка.")
     files = normalize_files(raw.get("files"), root, where)
     if tier in WORKER_TIERS and not files:
         raise PlanError(f"{where}: воркеру {tier} нужен files — какие файлы он правит (нужно для блокировки "
                         "пересечений между параллельными воркерами).")
     touches_code = any(os.path.splitext(p)[1].lower() in CODE_EXT for p in
                        (f[4:] if f.startswith("new:") else f for f in files))
-    if touches_code and not any(c["type"] in ("cmd", "http") for c in checks):
+    if touches_code and not light and not any(c["type"] in ("cmd", "http") for c in checks):
         raise PlanError(f"{where}: пункт правит код, а проверки только смотрят, что файл есть. Добавь cmd "
                         "(тест, сборка, запуск) или http.")
     deps = raw.get("depends_on") or []
@@ -361,7 +386,7 @@ def build_item(raw, item_id: str, root: str) -> dict:
         raise PlanError(f"{where}: context — строка (ориентиры file:L1-L2, символы, ограничения).")
     return {"id": item_id, "title": title.strip(), "acceptance": acceptance.strip(), "verify": checks,
             "tier": tier, "files": files, "depends_on": [str(d).strip() for d in deps],
-            "context": context.strip(), "status": "todo", "evidence": []}
+            "context": context.strip(), "status": "todo", "evidence": [], **({"light": light} if light else {})}
 
 
 def compute_waves(items: list) -> dict[str, int]:
@@ -416,7 +441,7 @@ def advice(plan: dict) -> list[str]:
     if len(items) >= REVIEW_MIN and len(mains) * 2 > len(items):
         notes.append(f"{len(mains)} из {len(items)} пунктов на main: независимые пункты дешевле отдать "
                      "code-low/code (Sonnet), себе оставь общие файлы и рискованное.")
-    weak = [i["id"] for i in items if all(c["type"] == "file_exists" for c in i["verify"])]
+    weak = [i["id"] for i in items if i["verify"] and all(c["type"] == "file_exists" for c in i["verify"])]
     if weak:
         notes.append(f"Пункты {', '.join(weak)} проверяются только наличием файла — это слабое доказательство.")
     todo = [i for i in items if i["status"] in OPEN]
@@ -433,10 +458,30 @@ def advice(plan: dict) -> list[str]:
         if len(ids) > 1:
             notes.append(f"Файл {path} правят пункты {', '.join(ids)} одной волны — пойдут по очереди в произвольном "
                          "порядке. Раздели файлы (тогда параллельно) или задай порядок через depends_on.")
+    from . import graph  # связи между файлами разных пунктов видны только по графу кода
+    owner = {path: i["id"] for i in crew for path in file_paths(i)}
+    seen = set()
+    for path, users in graph.links(plan.get("root") or "", list(owner)).items():
+        for user in users:
+            a, b = owner[path], owner.get(user)
+            if b and b != a and waves[a] == waves[b] and (a, b) not in seen and (b, a) not in seen:
+                seen.add((a, b))
+                notes.append(f"Пункты {a} и {b} одной волны связаны по графу кода: {user} использует {path}. Меняется "
+                             "интерфейс — задай порядок через depends_on, иначе воркеры разойдутся.")
     return notes
 
 
 # ───────────────────────── операции над планом ─────────────────────────
+
+def git_branch(root: str) -> str | None:
+    """Текущая ветка проекта; None — не git или HEAD не на ветке."""
+    try:
+        out = subprocess.run(["git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True,
+                             timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out if out and out != "HEAD" else None
+
 
 def git_head(root: str) -> str:
     try:
@@ -471,6 +516,7 @@ def init(root: str, title: str, goal: str, items, review="auto", track="auto", r
                          json.dumps(old, ensure_ascii=False, indent=1))
         plan = {"version": 1, "root": root, "project": os.path.basename(root), "title": title.strip(),
                 "goal": goal.strip(), "status": "active", "created_at": now(), "base_rev": git_head(root),
+                "branch": git_branch(root),
                 "review_mode": review, "track": track, "docs": {"mode": docs, "published": []},
                 "items": [], "history": []}
         _append_items(plan, items, root)
@@ -487,8 +533,8 @@ def approval_quote(user_approval, what: str) -> str:
 
 
 def update(root: str, add=None, changes=None, hold=None, title=None, goal=None, remove=None,
-           user_approval=None) -> dict:
-    if not add and not changes and not remove and hold is None and title is None and goal is None:
+           user_approval=None, branch=None) -> dict:
+    if not add and not changes and not remove and hold is None and title is None and goal is None and branch is None:
         raise PlanError("Нечего менять: передай add (новые пункты), update (правки пунктов), remove (удалить "
                         "пункты), title, goal или hold.")
     if title is not None and (not isinstance(title, str) or len(title.strip()) < 3):
@@ -505,6 +551,13 @@ def update(root: str, add=None, changes=None, hold=None, title=None, goal=None, 
             plan.pop("finished_at", None)
             plan.pop("closed_as_is", None)
             event(plan, "reopen")
+        if branch is not None:
+            cur = git_branch(root)
+            if not cur or str(branch).strip() != cur:
+                raise PlanError(f"branch: план переносится только в текущую ветку проекта, а сейчас {cur or 'HEAD не на ветке'}. "
+                                "Переключись на нужную ветку и повтори.")
+            event(plan, "branch", note=f"{plan.get('branch')} → {cur}")
+            plan["branch"] = cur
         if title is not None:
             plan["title"] = title.strip()
             event(plan, "retitle", note=plan["title"])
@@ -528,9 +581,14 @@ def update(root: str, add=None, changes=None, hold=None, title=None, goal=None, 
             if it["status"] == "in_progress" and it.get("job"):
                 raise PlanError(f"Пункт {it['id']} сейчас у воркера. Останови: plan_worker(action=kill|steer).")
             merged = {**{k: it[k] for k in ("title", "acceptance", "verify", "tier", "files", "depends_on", "context")},
-                      **{k: v for k, v in ch.items() if k not in ("id", "reopen")}}
+                      "light": it.get("light"), **{k: v for k, v in ch.items() if k not in ("id", "reopen")}}
+            if ch.get("verify") and "light" not in ch:
+                merged["light"] = None  # пункту дали проверку — он больше не light
             fresh = build_item(merged, it["id"], root)
             it.update({k: fresh[k] for k in ("title", "acceptance", "verify", "tier", "files", "depends_on", "context")})
+            it.pop("light", None)
+            if fresh.get("light"):
+                it["light"] = fresh["light"]
             if ch.get("reopen"):
                 it["status"] = "todo"
                 for key in ("closed_at", "manual", "skip"):
@@ -554,6 +612,10 @@ def ready_items(plan: dict) -> list:
 
 def start_gate(plan: dict, item: dict) -> str | None:
     """None — можно стартовать; иначе причина отказа."""
+    want, cur = plan.get("branch"), git_branch(plan.get("root") or "") if plan.get("branch") else None
+    if want and cur and cur != want:
+        return (f"план ведётся в ветке {want}, а сейчас {cur}: вернись (git switch {want}) или перенеси план — "
+                f"plan_update(branch=\"{cur}\")")
     if item["status"] in CLOSED:
         return f"пункт уже {item['status']}"
     if item["status"] == "in_progress":
@@ -609,9 +671,21 @@ def skip(root: str, item_ids, reason: str, user_approval: str, outcome: str = "s
     return plan
 
 
+def escalate(root: str, item_id: str) -> str | None:
+    """Поднять упавший пункт на ярус выше. Возвращает новый ярус или None, если выше некуда."""
+    with mutate(root) as plan:
+        it = find(plan, item_id)
+        up = ESCALATE.get(it["tier"])
+        if not up or it["status"] != "failed":
+            return None
+        it.update(escalated_from=it["tier"], tier=up)
+        event(plan, "escalate", it["id"], f"{it['escalated_from']} → {up}")
+    return up
+
+
 def recheckable(plan: dict) -> list[str]:
-    """Пункты для повторного прогона проверок: done, кроме принятых пользователем без проверки."""
-    return [i["id"] for i in plan["items"] if i["status"] == "done" and not i.get("manual")]
+    """Пункты для повторного прогона проверок: done, кроме принятых пользователем и пунктов light."""
+    return [i["id"] for i in plan["items"] if i["status"] == "done" and not i.get("manual") and not i.get("light")]
 
 
 # ───────────────────────── проверки ─────────────────────────
@@ -690,20 +764,30 @@ def _run_checks(root: str, checks: list, cache: dict | None = None) -> tuple[boo
     return all(r["passed"] for r in results), results, "\n".join(log)
 
 
-def verify_items(root: str, item_ids: list, by: str = "main", recheck: bool = False) -> list[tuple[dict, dict]]:
+def verify_items(root: str, item_ids: list, by: str = "main", recheck: bool = False,
+                 note: str | None = None) -> list[tuple[dict, dict]]:
     """Запускает проверки пунктов (параллельно между пунктами) и фиксирует evidence.
 
     Единственный путь в done. recheck=True — повторный прогон закрытых пунктов (регрессия).
+    Пункты light проверок не имеют: закрываются записью note — что сделал и чем убедился.
     Возвращает [(пункт, запись evidence)].
     """
     with locked(root):
         plan = load(root)
-        targets = []
+        targets, light = [], []
         for iid in dict.fromkeys(str(i) for i in item_ids):
             it = find(plan, iid)
+            if it.get("light") and recheck:
+                continue
             if it["status"] == "skipped" or (it["status"] == "done" and not recheck):
                 raise PlanError(f"Пункт {it['id']} уже {it['status']}; повторная проверка — plan_finish/plan_review.")
-            targets.append((it["id"], list(it["verify"]), len(it["evidence"]) + 1))
+            if it.get("light"):
+                light.append(it["id"])
+            else:
+                targets.append((it["id"], list(it["verify"]), len(it["evidence"]) + 1))
+        if light and (not isinstance(note, str) or len(note.strip()) < 10):
+            raise PlanError(f"Пункты без проверки ({', '.join(light)}) закрываются записью: plan_verify(item_ids=[...], "
+                            "note=\"что сделал и чем убедился\") — не короче 10 символов.")
     cache: dict = {} if recheck else None  # одинаковые проверки разных пунктов гоняем один раз
 
     def one(target):
@@ -718,6 +802,14 @@ def verify_items(root: str, item_ids: list, by: str = "main", recheck: bool = Fa
         done = list(pool.map(one, targets))
     out = []
     with mutate(root) as plan:
+        for iid in light:
+            it = find(plan, iid)
+            ev = {"ts": now(), "passed": True, "by": by, "log": None, "checks": [], "note": note.strip()[:500]}
+            it["evidence"].append(ev)
+            it.update(status="done", closed_at=now(), job=None, done_note=ev["note"])
+            it.pop("note", None)
+            event(plan, "done_light", iid, ev["note"][:120])
+            out.append((dict(it), ev))
         for iid, ev in done:
             it = find(plan, iid)
             it["evidence"].append(ev)
@@ -762,7 +854,7 @@ def finish_blockers(plan: dict) -> list[str]:
         out.append("не пройдена приёмка" + (" (лимит раундов исчерпан — нужно решение пользователя)"
                                                if review_stuck(plan) else ": вызови plan_review"))
     elif needs_docs(plan) and not docs_ok(plan):
-        out.append("документация не опубликована после последних изменений: wiki_pages → wiki_publish")
+        out.append("документация не опубликована после последних изменений: wiki_publish(title, notes) — страницу напишет воркер")
     return out
 
 
@@ -832,6 +924,8 @@ def status_line(plan: dict) -> str:
     extra = f" | приёмка: {'пройдена' if review_approved(plan) else 'нужна'}" if needs_review(plan) else ""
     if needs_docs(plan):
         extra += f" | вики: {'опубликована' if docs_ok(plan) else 'нужна'}"
+    if plan.get("branch"):
+        extra += f" | ветка: {plan['branch']}"
     hold = f" | HOLD: {plan['hold']}" if plan.get("hold") else ""
     key = (plan.get("plane") or {}).get("issue_key")
     return f"«{plan['title']}» — {plan['status']} ({counts(plan)}){extra}{hold}" + (f" | {key}" if key else "")
@@ -847,10 +941,13 @@ def render(plan: dict) -> str:
             tail = " — " + fail_summary(it["evidence"][-1])[:160]
         elif it.get("note"):
             tail = " — " + it["note"][:160]
+        elif it.get("light") and it["status"] == "done":
+            tail = " — " + str(it.get("done_note") or "")[:160]
         elif it.get("manual") or it.get("skip"):
             stamp = it.get("manual") or it["skip"]
             tail = f" — {'принят' if it.get('manual') else 'пропущен'} решением пользователя: {stamp['reason'][:120]}"
-        lines.append(f"- {BOX[it['status']]} {it['id']} ({it['tier']}, волна {waves.get(it['id'], '?')}{deps}) "
+        kind = f", без проверки: {LIGHT[it['light']]}" if it.get("light") else ""
+        lines.append(f"- {BOX[it['status']]} {it['id']} ({it['tier']}{kind}, волна {waves.get(it['id'], '?')}{deps}) "
                      f"{it['title']}{tail}")
     rounds = review_rounds(plan)
     if rounds:
@@ -870,12 +967,14 @@ def item_detail(plan: dict, item_id) -> str:
     it = find(plan, item_id)
     lines = [f"{BOX[it['status']]} {it['id']} ({it['tier']}) {it['title']}", f"Приёмка: {it['acceptance']}",
              "Файлы: " + (", ".join(it["files"]) or "—"),
-             "Проверки: " + "; ".join(f"{c['type']}: {check_label(c)}" for c in it["verify"])]
+             (f"Без проверки: {LIGHT[it['light']]} — закрывается записью plan_verify(note=...)" if it.get("light") else
+              "Проверки: " + "; ".join(f"{c['type']}: {check_label(c)}" for c in it["verify"]))]
     if it.get("context"):
         lines.append("Контекст: " + it["context"][:1200])
     if it.get("note"):
         lines.append("Заметка: " + it["note"])
     for ev in it["evidence"][-3:]:
-        lines.append(f"- {ev['ts']} {'PASS' if ev['passed'] else 'FAIL'} ({ev['by']}) лог {ev['log']}"
+        lines.append(f"- {ev['ts']} {'PASS' if ev['passed'] else 'FAIL'} ({ev['by']}) "
+                     + (f"лог {ev['log']}" if ev.get("log") else "без проверки: " + str(ev.get("note") or ""))
                      + ("" if ev["passed"] else " — " + fail_summary(ev)))
     return "\n".join(lines)

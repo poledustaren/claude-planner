@@ -91,7 +91,7 @@ class Hooks(ProjectCase):
         out = edit(target)["hookSpecificOutput"]
         self.assertEqual(out["permissionDecision"], "deny")
         self.assertIn(f'plan_init(project_dir="{self.dir}"', out["permissionDecisionReason"])
-        self.assertIn("один пункт", out["permissionDecisionReason"])  # лёгкий план — тоже план
+        self.assertIn("light: trivial", out["permissionDecisionReason"])  # мелочь — пункт без проверки, но в плане
         sub = edit(target, agent_id="a1")["hookSpecificOutput"]["permissionDecisionReason"]
         self.assertIn("основная сессия", sub)
         self.assertNotIn("plan_init", sub)
@@ -105,6 +105,36 @@ class Hooks(ProjectCase):
         core.verify_items(self.dir, ["1"])
         core.finish(self.dir, "готово, проверки прошли")
         self.assertEqual(edit(target)["hookSpecificOutput"]["permissionDecision"], "deny")  # план закрыт — нужен новый
+
+    def test_checklist_plan_allows_one_code_file_per_light_item(self):
+        edit = lambda name: hook("plan_gate", {"tool_name": "Edit", "tool_input": {"file_path": os.path.join(self.dir, name)}})  # noqa: E731
+        core.init(self.dir, "Мелочи", "поправить опечатку в одном месте", [{"title": "Опечатка", "light": "trivial"}])
+        self.assertEqual(edit("a.py"), {})
+        self.assertEqual(edit("a.py"), {})  # тот же файл — сколько угодно
+        self.assertEqual(edit("README.md"), {})  # не код — без счёта
+        out = edit("b.py")["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("2-й файл кода", out["permissionDecisionReason"])
+        core.update(self.dir, add=[item("Пункт с проверкой")])
+        self.assertEqual(edit("b.py"), {})  # в плане появился пункт с проверкой — границы чеклиста больше нет
+
+    def test_plan_is_bound_to_its_branch(self):
+        git = lambda *a: subprocess.run(["git", "-C", self.dir, *a], check=True, capture_output=True)  # noqa: E731
+        edit = lambda: hook("plan_gate", {"tool_name": "Edit", "tool_input": {"file_path": os.path.join(self.dir, "a.py")}})  # noqa: E731
+        git("checkout", "-q", "-b", "feature/x")
+        plan = core.init(self.dir, "План", "цель плана достаточно длинная", [item(), item("Второй")])
+        self.assertEqual(plan["branch"], "feature/x")
+        self.assertIn("ветка: feature/x", core.status_line(plan))
+        self.assertEqual(edit(), {})
+        git("checkout", "-q", "-b", "other")
+        reason = edit()["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("ведётся в ветке feature/x, а сейчас other", reason)
+        self.assertIn("ветке feature/x", core.start_gate(self.plan(), self.plan()["items"][0]))
+        with self.assertRaisesRegex(core.PlanError, "только в текущую ветку"):
+            core.update(self.dir, branch="feature/x")
+        core.update(self.dir, branch="other")  # осознанный перенос плана в текущую ветку
+        self.assertEqual(edit(), {})
+        self.assertIsNone(core.start_gate(self.plan(), self.plan()["items"][0]))
 
     def test_plan_gate_leaves_non_project_files_alone(self):
         edit = lambda path, env=None: hook("plan_gate", {"tool_name": "Write", "tool_input": {"file_path": path}}, env)  # noqa: E731
@@ -169,6 +199,33 @@ class WorkerInternals(ProjectCase):
         self.assertIn("--resume", edit)
         self.assertIn("Bash(git push:*)", edit[edit.index("--disallowedTools"):])
         self.assertEqual(edit[edit.index("--setting-sources") + 1], "")
+
+    def test_worker_may_edit_only_files_of_its_item(self):
+        os.makedirs(os.path.join(self.dir, "pkg"))
+        core.init(self.dir, "План", "цель плана достаточно длинная",
+                  [item("Править a", tier="code", files=["a.py", "new:tests/test_a.py", "pkg/"], verify=["python3 a.py"])])
+        job = {**self.job("code"), "root": self.dir, "item_id": "1"}
+        cmd = workers.build_cmd(job, resume=False)
+        allowed = cmd[cmd.index("--allowedTools") + 1:cmd.index("--disallowedTools")]
+        self.assertEqual([a for a in allowed if a.startswith("Edit")],
+                         [f"Edit(/{self.dir}/a.py)", f"Edit(/{self.dir}/tests/test_a.py)", f"Edit(/{self.dir}/pkg/**)"])
+        self.assertNotIn("Write", allowed)  # голых Edit и Write нет: чужой файл воркер поправить не может
+        self.assertIn("Bash(git switch:*)", cmd[cmd.index("--disallowedTools"):])
+
+    def test_graph_links_warn_about_coupled_parallel_items(self):
+        from planner import graph
+        real = graph.links
+        graph.links = lambda root, files, cap=24: {"a.py": ["b.py"]} if "a.py" in files else {}
+        try:
+            plan = core.init(self.dir, "План", "цель плана достаточно длинная",
+                             [item("Править a", tier="code", files=["a.py"], verify=["python3 a.py"]),
+                              item("Править b", tier="code", files=["b.py"], verify=["python3 b.py"])])
+            self.assertTrue(any("связаны по графу кода: b.py использует a.py" in n for n in core.advice(plan)))
+            self.assertIn("КТО ИСПОЛЬЗУЕТ ЭТИ ФАЙЛЫ", workers.item_prompt(plan, plan["items"][0]))
+            core.update(self.dir, changes=[{"id": "2", "depends_on": ["1"]}])
+            self.assertFalse(any("по графу" in n for n in core.advice(self.plan())))  # порядок задан — предупреждения нет
+        finally:
+            graph.links = real
 
     def test_tier_override_from_config(self):
         path = os.path.join(os.environ["HOME"], ".config", "claude-planner", "config.json")

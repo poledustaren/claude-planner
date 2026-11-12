@@ -1,7 +1,7 @@
 import os
 import unittest
 
-from helpers import ProjectCase, core, item
+from helpers import ProjectCase, core, item, plane
 
 
 class Validation(ProjectCase):
@@ -248,3 +248,49 @@ class ChangedCircumstances(ProjectCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LightItems(ProjectCase):
+    """Пункты без проверки: ограниченный набор ситуаций, закрываются записью, а не прогоном verify."""
+
+    def test_light_item_closes_with_note_and_plan_stays_cheap(self):
+        plan = core.init(self.dir, "Мелочи", "поправить опечатку и разобраться с падением",
+                         [{"title": "Опечатка в README", "light": "мелкая правка"},
+                          {"title": "Найти причину падения", "light": "debug"}])
+        self.assertEqual([i["light"] for i in plan["items"]], ["trivial", "debug"])
+        self.assertEqual([i["tier"] for i in plan["items"]], ["main", "main"])
+        self.assertFalse(core.needs_review(plan) or core.needs_docs(plan) or plane.tracked(plan))
+        with self.assertRaisesRegex(core.PlanError, "note"):
+            core.verify_items(self.dir, ["1"])
+        (it, ev), = core.verify_items(self.dir, ["1"], note="исправил опечатку в заголовке, перечитал")
+        self.assertEqual((it["status"], ev["passed"], ev["log"]), ("done", True, None))
+        self.assertIn("без проверки: мелкая правка", core.render(self.plan()))
+        self.assertIn("исправил опечатку", core.render(self.plan()))
+        core.verify_items(self.dir, ["2"], note="причина — пустой конфиг, воспроизвёл")
+        self.assertEqual(self.plan()["status"], "ready")
+        self.assertEqual(core.recheckable(self.plan()), [])  # при закрытии плана перепроверять нечего
+        self.assertEqual(core.finish(self.dir, "мелочи закрыты, причина падения найдена")["status"], "finished")
+
+    def test_light_is_a_closed_list_main_only_and_has_no_verify(self):
+        bad = lambda **kw: core.init(self.dir, "План", "цель плана достаточно длинная", [{"title": "Штука", **kw}])  # noqa: E731
+        with self.assertRaisesRegex(core.PlanError, "light — один из"):
+            bad(light="мне лень")
+        with self.assertRaisesRegex(core.PlanError, "убери light"):
+            bad(light="trivial", verify=["python3 a.py"])
+        with self.assertRaisesRegex(core.PlanError, "tier main"):
+            bad(light="trivial", tier="code", files=["a.py"])
+        with self.assertRaisesRegex(core.PlanError, "только пункты light"):
+            bad(acceptance="наблюдаемый результат есть")  # без light проверка обязательна, как и раньше
+
+    def test_giving_a_check_makes_the_item_ordinary(self):
+        core.init(self.dir, "План", "цель плана достаточно длинная", [{"title": "Штука", "light": "trivial"}])
+        core.update(self.dir, changes=[{"id": "1", "acceptance": "скрипт отрабатывает без ошибок", "verify": ["python3 a.py"]}])
+        it = self.plan()["items"][0]
+        self.assertNotIn("light", it)
+        self.assertTrue(plane.tracked(self.plan()))
+        (it, ev), = core.verify_items(self.dir, ["1"])
+        self.assertTrue(ev["passed"] and ev["log"])
+
+    def test_mixed_plan_counts_only_checked_items_for_review(self):
+        items = [item(f"Пункт {n}") for n in range(3)] + [{"title": "Заметка в README", "light": "nocode"}]
+        self.assertFalse(core.needs_review(core.init(self.dir, "План", "цель плана достаточно длинная", items)))

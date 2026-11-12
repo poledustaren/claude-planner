@@ -88,7 +88,10 @@ def client() -> Client | None:
 
 
 def tracked(plan: dict) -> bool:
-    return plan.get("track", "auto") is not False
+    flag = plan.get("track", "auto")
+    if flag in (True, False):
+        return flag
+    return bool(core.heavy(plan)) or bool((plan.get("plane") or {}).get("issue_id"))  # чеклист из light в трекер не идёт
 
 
 # ───────────────────────── паспорт проекта ─────────────────────────

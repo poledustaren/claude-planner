@@ -287,6 +287,31 @@ class FakeOutline:
 DOC = "## Цель\nФункция a возвращает 42.\n## Что сделано\nИсправлена a.py.\n## Как проверять\npython3 -c 'import a'\n"
 
 
+class Escalation(ProjectCase):
+    def test_mini_tier_fails_checks_and_is_rerun_one_tier_up(self):
+        self.scenario({"items": {"1": {"first:haiku": [], "resume": [], "first:sonnet": [["write", "out.txt", "x"]]}}})
+        flow.init(self.dir, "План", "файл out.txt появляется в проекте",
+                  [item("Создать out.txt", tier="mini", files=["new:out.txt"])])
+        self.assertEqual(self.plan()["items"][0]["tier"], "code-mini")
+        out = flow.run(self.dir, timeout=60)
+        self.assertIn("code-mini (haiku)", out)
+        self.assertIn("code-mini не справился — повышен: 1: code-low (sonnet)", out)
+        self.drain()
+        it = self.plan()["items"][0]
+        self.assertEqual((it["tier"], it["escalated_from"], it["status"]), ("code-low", "code-mini", "done"))
+        models = [(c["model"], c["resume"]) for c in self.calls()]
+        self.assertEqual(models, [("haiku", False), ("haiku", True), ("sonnet", False)])  # попытка, доработка, повышение
+        self.assertIn("ПРЕДЫДУЩАЯ ПОПЫТКА младшей модели", self.calls()[-1]["prompt"])
+
+    def test_blocked_worker_is_not_escalated(self):
+        self.scenario({"items": {"1": {"first": [["blocked"]]}}})
+        flow.init(self.dir, "План", "файл out.txt появляется в проекте",
+                  [item("Создать out.txt", tier="code-mini", files=["new:out.txt"])])
+        out = flow.run(self.dir, timeout=60)
+        self.assertNotIn("повышен", out)
+        self.assertEqual(self.plan()["items"][0]["tier"], "code-mini")  # не хватает файла — модель сильнее не поможет
+
+
 class PlaneAndWiki(ProjectCase):
     def setUp(self):
         super().setUp()
@@ -294,6 +319,13 @@ class PlaneAndWiki(ProjectCase):
         self.ol = FakeOutline()
         plane.FACTORY = lambda: plane.Client("https://plane.test", "k", "ws", transport=self.pl)
         outline.FACTORY = lambda: (outline.Outline("https://wiki.test", "t", post=self.ol), "hermes")
+        self.policy("always")
+
+    def policy(self, value):
+        path = os.path.join(os.environ["HOME"], ".config", "claude-planner", "config.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump({"docs": value} if value else {}, fh)
 
     def test_every_plan_gets_issue_and_passport(self):
         out = flow.init(self.dir, "План", "функция a возвращает 42", [item()],
@@ -373,12 +405,38 @@ class PlaneAndWiki(ProjectCase):
         self.assertIn("Опубликовано (update)", flow.wiki_publish(self.dir, "Как устроено", DOC))
         self.assertEqual(self.plan()["status"], "ready")
 
-    def test_docs_policy_from_config(self):
-        path = os.path.join(os.environ["HOME"], ".config", "claude-planner", "config.json")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as fh:
-            json.dump({"docs": "big"}, fh)
+    def test_docs_needed_from_four_items_by_default(self):
+        self.policy(None)  # политика по умолчанию — big
         self.assertIn("вики не требуется", flow.init(self.dir, "План", "функция a возвращает 42", [item()]))
+        core.finish(self.dir, "план снят пользователем", user_approval="бросай", force=True)
+        self.assertIn("вики нужна", flow.init(self.dir, "План", "функция a возвращает 42", [item() for _ in range(4)]))
+        core.finish(self.dir, "план снят пользователем", user_approval="бросай", force=True)
+        self.assertIn("вики не требуется", flow.init(self.dir, "Багфикс", "функция a снова возвращает 42",
+                                                    [item() for _ in range(4)], docs=False))
+        core.finish(self.dir, "план снят пользователем", user_approval="бросай", force=True)
+        self.assertIn("вики нужна", flow.init(self.dir, "Новый запуск", "сервис стартует юнитом systemd",
+                                             [item()], docs=True))  # меняется запуск — вики и для малого плана
+
+    def test_cheap_worker_writes_the_page_from_plan_materials(self):
+        flow.init(self.dir, "План", "функция a возвращает 42", [item()])
+        self.write("out.txt", "x")
+        flow.verify(self.dir, ["1"])
+        out = flow.wiki_publish(self.dir, "Как устроено", notes="Решили не трогать сериализатор: его правит другой отдел.")
+        self.assertIn("Опубликовано (create)", out)
+        self.assertIn("Страницу написал воркер (haiku", out)
+        self.assertIn("разделы: Цель, Что сделано", out)
+        call = [c for c in self.calls() if "ЗАМЕТКИ ОРКЕСТРАТОРА" in c["prompt"]][-1]
+        self.assertEqual((call["model"], call["tools"]), ("haiku", "Read,Grep,Glob,Bash"))  # дешёвый и только читает
+        for piece in ("СТРАНИЦА: Как устроено", "ЦЕЛЬ: функция a возвращает 42", "test -f out.txt — PASS",
+                      "не трогать сериализатор"):
+            self.assertIn(piece, call["prompt"])
+        page = next(d for d in self.ol.docs.values() if d["title"] == "Как устроено")
+        self.assertIn("## Грабли", page["text"])
+        self.assertNotIn("supersecret123", page["text"])  # секреты маскируются и в тексте воркера
+        self.assertEqual(self.plan()["status"], "ready")
+        self.scenario({"docs": "не получилось"})
+        with self.assertRaisesRegex(core.PlanError, "передай markdown сам"):
+            flow.wiki_publish(self.dir, "Вторая страница")
 
     def test_plane_failure_does_not_break_plan(self):
         def boom(*_a, **_k):

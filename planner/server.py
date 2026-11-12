@@ -16,11 +16,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from planner import core, flow  # noqa: E402
 
-VERSION = "1.2.0"
+VERSION = "1.4.0"
 DIRP = {"type": "string", "description": "Абсолютный путь к папке проекта"}
 IDS = {"type": "array", "items": {"type": "string"}}
 ITEM = {
-    "type": "object", "required": ["title", "acceptance", "verify"],
+    "type": "object", "required": ["title"],
     "properties": {
         "title": {"type": "string"},
         "acceptance": {"type": "string", "description": "Наблюдаемый результат, по которому видно, что сделано"},
@@ -28,11 +28,14 @@ ITEM = {
                    "{type:cmd,cmd,timeout?,contains?} | {type:file_contains,path,pattern} | "
                    "{type:file_exists,paths} | {type:http,url,expect_status?,contains?}", "items": {}},
         "tier": {"type": "string", "enum": list(core.TIERS),
-                 "description": "main — сам оркестратор; code-low — Sonnet/low (механика по образцу); "
-                                "code — Sonnet/medium (по умолчанию); code-high — Sonnet/high (ветвистое)"},
+                 "description": "main — сам; code-mini — Haiku (механика, при провале сам уходит на code-low); code-low — "
+                                "Sonnet/low; code — Sonnet/medium (по умолчанию); code-high — Sonnet/high"},
         "files": {"type": "array", "items": {"type": "string"},
                   "description": "Пути от корня проекта, которые правит пункт; создаваемые — new:путь"},
         "depends_on": IDS,
+        "light": {"type": "string", "enum": list(core.LIGHT),
+                  "description": "Без verify, закрывается plan_verify(note): отладка, эксперимент, не код, мелочь, "
+                                 "доделка. Только main"},
         "context": {"type": "string", "description": "Ориентиры для воркера: path/file.py:L10-L80 (срез будет "
                     "вшит в его промпт), имена символов, ограничения"},
     },
@@ -51,22 +54,28 @@ TOOLS = [
                                              "description": "По одному конкретному вопросу на подсистему"},
           "wait": {"type": "boolean", "default": True}, "timeout": {"type": "integer", "default": 300}},
          ["project_dir", "questions"]),
-    tool("plan_init", "Создать план. Нужен для задач из 2+ пунктов; мелочь в один файл делай без плана. Сразу заводит "
-         "задачу в Plane и обновляет паспорт проекта в Pages. Приёмка (review=\"auto\") включается от 4 пунктов.",
+    tool("plan_init", "Создать план: без него хук не даст править файлы проекта. Мелочь — пункты light (без Plane, "
+         "вики, приёмки); иначе пункты с verify, приёмка от 4 пунктов.",
          {"project_dir": DIRP, "title": {"type": "string"},
-          "goal": {"type": "string", "description": "Какой результат получит пользователь"},
+          "goal": {"type": "string", "description": "Результат для пользователя"},
           "items": {"type": "array", "items": ITEM},
           "review": {"description": "\"auto\" | true | false", "default": "auto"},
-          "stack": {"type": "string", "description": "Паспорт проекта в Plane: стек (иначе определится по файлам)"},
-          "features": {"type": "string", "description": "Паспорт: назначение и особенности проекта"},
-          "deploy_rules": {"type": "string", "description": "Паспорт: как деплоится и проверяется"},
-          "links": {"type": "string", "description": "Паспорт: репозиторий, стенды, дашборды"}},
+          "docs": {"description": "Вики: \"auto\" — от 4 пунктов | true — меняется запуск, контракт, схема | "
+                                  "false — багфикс, рефакторинг", "default": "auto"},
+          "stack": {"type": "string", "description": "Паспорт в Plane: стек"},
+          "features": {"type": "string", "description": "Паспорт: назначение"},
+          "deploy_rules": {"type": "string", "description": "Паспорт: деплой и проверка"},
+          "links": {"type": "string", "description": "Паспорт: репозиторий, стенды"}},
          ["project_dir", "title", "goal", "items"]),
     tool("plan_update", "Изменить план: add — новые пункты (в т.ч. доработка после приёмки); update — правка "
          "полей пункта по id (reopen:true переоткрывает закрытый); title, goal — название и цель; remove — "
          "удалить пункты (с user_approval); hold — причина паузы (ждём пользователя), пустая строка снимает.",
-         {"project_dir": DIRP, "add": {"type": "array", "items": ITEM},
-          "update": {"type": "array", "items": {"type": "object"}}, "hold": {"type": "string"},
+         {"project_dir": DIRP,
+          "add": {"type": "array", "items": {"type": "object"}, "description": "Пункты, как items в plan_init"},
+          "update": {"type": "array", "items": {"type": "object"},
+                     "description": "{id, …поля пункта}; дать verify пункту light — он станет обычным"},
+          "hold": {"type": "string"},
+          "branch": {"type": "string", "description": "Перенести план в текущую ветку git"},
           "title": {"type": "string"}, "goal": {"type": "string"},
           "remove": IDS, "user_approval": {"type": "string", "description": "Цитата согласия пользователя (для remove)"}},
          ["project_dir"]),
@@ -91,7 +100,8 @@ TOOLS = [
          ["project_dir", "action", "id"]),
     tool("plan_verify", "Прогнать проверки пунктов, которые делал ты сам (main) или которые упали. Единственный "
          "путь пункта в done; пункты воркеров проверяет надзиратель.",
-         {"project_dir": DIRP, "item_ids": IDS}, ["project_dir"]),
+         {"project_dir": DIRP, "item_ids": IDS,
+          "note": {"type": "string", "description": "Для light: что сделал"}}, ["project_dir"]),
     tool("plan_skip", "Закрыть пункты без проверки, только с дословной цитатой согласия пользователя: "
          "outcome=skipped — не делаем; done — результат принят как есть (проверка устарела, сделано иначе).",
          {"project_dir": DIRP, "item_id": {"type": "string"}, "item_ids": IDS, "reason": {"type": "string"},
@@ -107,20 +117,20 @@ TOOLS = [
           "notes": {"type": "string", "description": "Пояснения приёмщику, в т.ч. возражения на прошлые блокеры"},
           "screenshots": {"type": "array", "items": {"type": "string"},
                           "description": "Пути к скриншотам для задач с интерфейсом"}}, ["project_dir"]),
-    tool("wiki_pages", "Страницы проекта в Outline (дерево «Проект · <имя>»): что уже задокументировано. Вызывай "
-         "перед wiki_publish, чтобы дополнять существующее, а не плодить дубли.",
+    tool("wiki_pages", "Страницы проекта в Outline: что уже задокументировано. Нужен, только если пишешь страницу сам.",
          {"project_dir": DIRP, "include_text": {"type": "boolean", "description": "Вернуть и текст страниц"}},
          ["project_dir"]),
-    tool("wiki_publish", "Опубликовать документацию в Outline после закрытия пунктов. Структура страницы: Цель → Что "
-         "сделано → Как устроено → Как запускать и проверять → Грабли → Ссылки. Ссылка сама попадает в задачу и "
-         "паспорт проекта в Plane. Секреты маскируются, но не вставляй их.",
-         {"project_dir": DIRP, "title": {"type": "string"}, "markdown": {"type": "string"},
+    tool("wiki_publish", "Опубликовать документацию в Outline после закрытия пунктов. Без markdown страницу пишет "
+         "воркер Haiku по плану, диффу и notes — так дешевле; тебе вернётся ссылка и оглавление.",
+         {"project_dir": DIRP, "title": {"type": "string"},
+          "notes": {"type": "string", "description": "3–6 строк: решения и грабли из разговора, которых нет в плане"},
+          "markdown": {"type": "string", "description": "Готовый текст, если пишешь сам"},
           "mode": {"type": "string", "enum": ["upsert", "append"], "default": "upsert"},
           "parent_title": {"type": "string", "description": "Раздел проекта, под который положить страницу"}},
-         ["project_dir", "title", "markdown"]),
-    tool("plan_finish", "Закрыть план: финальный прогон всех проверок, перевод задачи Plane в «В проверке». Требует "
-         "приёмки и свежей документации. С user_approval (цитата решения пользователя) закрывает без приёмки и "
-         "вики; с force=true — как есть (план устарел): открытые пункты → skipped, проверки не гоняются.",
+         ["project_dir", "title"]),
+    tool("plan_finish", "Закрыть план: финальный прогон проверок, задача Plane → «В проверке». Требует приёмки и "
+         "свежей вики. С user_approval (цитата пользователя) — без них; с force=true — как есть: открытые "
+         "пункты → skipped, проверки не гоняются.",
          {"project_dir": DIRP, "summary": {"type": "string", "description": "Что сделано и чем подтверждено"},
           "user_approval": {"type": "string"}, "force": {"type": "boolean"}},
          ["project_dir", "summary"]),
@@ -151,10 +161,10 @@ def dispatch(name: str, a: dict, progress) -> str:
         return flow.scout(d, a.get("questions"), a.get("wait", True), int(a.get("timeout", 300)), progress)
     if name == "plan_init":
         return flow.init(d, a.get("title"), a.get("goal"), a.get("items"), a.get("review", "auto"), "auto",
-                         {k: a.get(k) for k in ("stack", "features", "deploy_rules", "links")})
+                         {k: a.get(k) for k in ("stack", "features", "deploy_rules", "links")}, a.get("docs", "auto"))
     if name == "plan_update":
         return flow.update(d, a.get("add"), a.get("update"), a.get("hold"), a.get("title"), a.get("goal"),
-                           a.get("remove"), a.get("user_approval"))
+                           a.get("remove"), a.get("user_approval"), a.get("branch"))
     if name == "plan_run":
         return flow.run(d, a.get("item_ids"), a.get("wait"), int(a.get("timeout", 600)), bool(a.get("fresh")), progress)
     if name == "plan_jobs":
@@ -162,7 +172,7 @@ def dispatch(name: str, a: dict, progress) -> str:
     if name == "plan_worker":
         return flow.worker_ctl(d, a.get("action"), a.get("id"), a.get("hint"), bool(a.get("full")))
     if name == "plan_verify":
-        return flow.verify(d, a.get("item_ids"))
+        return flow.verify(d, a.get("item_ids"), a.get("note"))
     if name == "plan_skip":
         return flow.skip(d, a.get("item_id"), a.get("reason"), a.get("user_approval"), a.get("item_ids"),
                          a.get("outcome") or "skipped")
@@ -173,7 +183,8 @@ def dispatch(name: str, a: dict, progress) -> str:
     if name == "wiki_pages":
         return flow.wiki_pages(d, bool(a.get("include_text")))
     if name == "wiki_publish":
-        return flow.wiki_publish(d, a.get("title"), a.get("markdown"), a.get("mode", "upsert"), a.get("parent_title"))
+        return flow.wiki_publish(d, a.get("title"), a.get("markdown"), a.get("mode", "upsert"), a.get("parent_title"),
+                                 a.get("notes"), int(a.get("timeout", 600)), progress)
     if name == "plan_finish":
         return flow.finish(d, a.get("summary"), a.get("user_approval"), bool(a.get("force")))
     raise core.PlanError(f"Инструмента {name!r} нет.")

@@ -2,7 +2,8 @@
 
 Воркер стартует без пользовательских настроек, MCP и CLAUDE.md (≈5k токенов контекста
 вместо ≈47k у обычного субагента). Тир задаёт модель, effort и права:
-scout — Haiku, только чтение; code-low/code/code-high — Sonnet с правкой; review — приёмщик.
+scout — Haiku, только чтение; code-mini — Haiku с правкой (механика); code-low/code/code-high — Sonnet с правкой;
+review — приёмщик; docs — Haiku, пишет страницу документации.
 Каждый запуск — каталог <root>/.cplan/jobs/<job_id>/ с job.json и stream.jsonl.
 """
 from __future__ import annotations
@@ -24,17 +25,20 @@ MAX_PARALLEL = 4
 MAX_FIX_ROUNDS = 1
 DEFAULT_TIERS = {
     "scout": {"model": "haiku", "effort": None, "mode": "read", "timeout": 300},
+    "code-mini": {"model": "haiku", "effort": None, "mode": "edit", "timeout": 600},
     "code-low": {"model": "sonnet", "effort": "low", "mode": "edit", "timeout": 900},
     "code": {"model": "sonnet", "effort": "medium", "mode": "edit", "timeout": 1500},
     "code-high": {"model": "sonnet", "effort": "high", "mode": "edit", "timeout": 2400},
     "review": {"model": "opus", "effort": "medium", "mode": "read", "timeout": 900},
+    "docs": {"model": "haiku", "effort": None, "mode": "read", "timeout": 600},
 }
 ACTIVE = ("QUEUED", "RUNNING", "VERIFYING", "VERIFY_WAIT")
 EDITING = ("QUEUED", "RUNNING")
 READ_BASH = ("rg", "fd", "ls", "wc", "bat", "cat", "head", "tail", "sed -n", "tree", "stat", "file", "jq",
              "ast-grep", "codegraph", "git log", "git diff", "git show", "git status", "git blame",
              "git ls-files", "git grep", "git rev-parse")
-DENY_BASH = ("git commit", "git push", "git reset", "git checkout", "git restore", "git stash", "git clean",
+DENY_BASH = ("git commit", "git push", "git reset", "git checkout", "git switch", "git branch", "git worktree",
+             "git restore", "git stash", "git clean",
              "git rebase", "git merge", "sudo", "ssh", "scp", "rsync", "systemctl", "docker", "kubectl",
              "pip install", "npm install", "apt", "pkill", "killall")
 SCRUB_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION",
@@ -76,6 +80,19 @@ SYS_REVIEW = (
     "при отсутствии дефектов issues пустой. Проверки пунктов планер только что перезапустил сам — их "
     "результат дан в задании, не трать шаги на перезапуск. Нет блокеров — verdict=approved."
 )
+SYS_DOCS = (
+    "Ты технический писатель проекта {root}: пишешь страницу документации по закрытому плану. Только чтение. "
+    + COMMON_RULES + "\n"
+    "1) Только факты из задания и из файлов, которые ты сам открыл. Не знаешь — не пиши, не домысливай.\n"
+    "2) Утверждения об устройстве кода — со ссылкой file:line. Команды запуска и проверки бери из пунктов плана.\n"
+    "3) Заметки оркестратора — решения и грабли из разговора с пользователем: включи их по смыслу, не теряй.\n"
+    "4) Структура: # заголовок, затем ## Цель, ## Что сделано, ## Как устроено, ## Как запускать и проверять, "
+    "## Грабли, ## Ссылки. Пустой раздел не пиши. Коротко: страница читается за две минуты.\n"
+    "5) Секреты (пароли, токены, ключи) не цитируй — пиши, где они лежат.\n"
+    "6) Дан текущий текст страницы — верни её полный обновлённый текст: актуальное сохрани, новое допиши, "
+    "устаревшее по диффу убери.\n"
+    "Финальный ответ — только markdown страницы, без вступлений, пояснений и обрамляющих ```."
+)
 REVIEW_SCHEMA = {
     "type": "object", "required": ["verdict", "issues"], "additionalProperties": False,
     "properties": {
@@ -110,6 +127,20 @@ def hooks_script() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks.py")
 
 
+def edit_rules(job: dict) -> list[str]:
+    """Воркер правит только файлы своего пункта: правило Edit(//путь) покрывает и Edit, и Write (проверено на
+    Claude Code 2.1.322 с --permission-mode dontAsk). Запись через Bash этим не закрыта — её ловит out_of_scope."""
+    try:
+        item = core.find(core.load(job["root"]), job["item_id"])
+    except (KeyError, core.PlanError):
+        return ["Edit", "Write"]
+    rules = []
+    for rel in core.file_paths(item):
+        full = os.path.join(job["root"], rel)
+        rules.append("Edit(/" + full.rstrip("/") + ("/**" if rel.endswith("/") or os.path.isdir(full) else "") + ")")
+    return rules or ["Edit", "Write"]
+
+
 def build_cmd(job: dict, resume: bool) -> list[str]:
     tier = tiers()[job["tier"]]
     cmd = [claude_bin(), "-p", "--model", tier["model"], "--setting-sources", "", "--strict-mcp-config",
@@ -122,7 +153,7 @@ def build_cmd(job: dict, resume: bool) -> list[str]:
                 "--allowedTools", "Read", "Grep", "Glob", *[f"Bash({c}:*)" for c in READ_BASH]]
     else:
         cmd += ["--tools", "Read,Grep,Glob,Bash,Edit,Write",
-                "--allowedTools", "Read", "Grep", "Glob", "Bash", "Edit", "Write",
+                "--allowedTools", "Read", "Grep", "Glob", "Bash", *edit_rules(job),
                 "--disallowedTools", *[f"Bash({c}:*)" for c in DENY_BASH]]
     guard = {"hooks": {"PreToolUse": [{"matcher": "Read", "hooks": [
         {"type": "command", "command": f"{sys.executable} {hooks_script()} read_cap", "timeout": 5}]}]}}
@@ -176,6 +207,13 @@ def item_prompt(plan: dict, item: dict) -> str:
     parts.append("ПРОВЕРКИ (cwd = корень проекта):\n" + "\n".join(
         f"- {c['type']}: {core.check_label(c)}" + (f" → в выводе должно быть {c['contains']!r}" if c.get("contains") else "")
         for c in item["verify"]))
+    if plan.get("branch"):
+        parts.append(f"ВЕТКА: {plan['branch']} — не переключай и не создавай другие.")
+    from . import graph
+    users = graph.links(root, core.file_paths(item))
+    if users:
+        parts.append("КТО ИСПОЛЬЗУЕТ ЭТИ ФАЙЛЫ (граф кода; чужие файлы не правь, но и не ломай их): "
+                     + "; ".join(f"{f} ← {', '.join(u[:8])}" for f, u in users.items()))
     if item.get("context"):
         parts.append("КОНТЕКСТ: " + item["context"])
         slices = hydrate(root, item["context"])

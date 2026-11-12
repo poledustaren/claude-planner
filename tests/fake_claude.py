@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Подставной claude для тестов: читает сценарий из <cwd>/.fake.json и выдаёт stream-json.
 
-Сценарий: {"items": {"<id>": {"first": [ops], "resume": [ops]}}, "reviews": [structured, ...], "scout": "текст"}
+Сценарий: {"items": {"<id>": {"first": [ops], "resume": [ops]}}, "reviews": [structured, ...], "scout": "текст",
+           "docs": "markdown страницы"}
 ops: ["write", path, content] | ["sleep", sec] | ["fail"] | ["blocked"]
 """
 import json
@@ -40,11 +41,16 @@ if opt("--json-schema"):
     text = json.dumps(structured)
 elif "разведчик" in (opt("--system-prompt") or ""):
     text = scenario.get("scout", "ГДЕ: a.py:1")
+elif "технический писатель" in (opt("--system-prompt") or ""):
+    text = scenario.get("docs", "# Страница\n\n## Цель\nФункция a возвращает 42 (a.py:1).\n\n## Что сделано\n"
+                        "Исправлена a.py, добавлен out.txt.\n\n## Как запускать и проверять\n`test -f out.txt`\n\n"
+                        "## Грабли\nПароль лежит в Vault, token=supersecret123 сюда попасть не должен.\n")
 else:
     m = re.search(r"ПУНКТ (\S+):", prompt)
     item = m.group(1) if m else memo.get(sid)
     memo[sid] = item
-    ops = (scenario.get("items", {}).get(item) or {}).get("resume" if resume else "first") or []
+    entry, key = scenario.get("items", {}).get(item) or {}, "resume" if resume else "first"
+    ops = entry.get(f"{key}:{opt('--model')}") or entry.get(key) or []  # «first:sonnet» — сценарий под модель
 json.dump(memo, open(memo_path, "w"))
 n = 0
 for op in ops:

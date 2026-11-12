@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -23,10 +24,10 @@ def next_hint(root: str, plan: dict) -> str:
     if plan["status"] == "ready":
         return "Дальше: plan_finish(summary)."
     if plan["status"] == "docs_pending":
-        return ("Дальше: документация. wiki_pages(project_dir) — что уже есть по проекту; затем "
-                "wiki_publish(project_dir, title, markdown): дополни существующую страницу или заведи новую под "
-                "новую тему. После — plan_finish(summary). Вики недоступна или пользователь от неё отказался — "
-                "plan_finish(summary, user_approval=<его цитата>).")
+        return ("Дальше: документация. wiki_publish(project_dir, title, notes=\"решения и грабли из разговора, "
+                "которых нет в плане\") — страницу напишет воркер по плану и диффу, тебе вернётся ссылка. Тема уже "
+                "описана — дай тот же title: воркер обновит страницу. После — plan_finish(summary). Вики недоступна "
+                "или пользователь от неё отказался — plan_finish(summary, user_approval=<его цитата>).")
     if plan["status"] == "review_pending":
         if core.review_stuck(plan):
             return ("Лимит раундов приёмки исчерпан: покажи пользователю блокеры и спроси решение; "
@@ -41,7 +42,13 @@ def next_hint(root: str, plan: dict) -> str:
     ready = [i["id"] for i in core.ready_items(plan)]
     mains = [i["id"] for i in plan["items"] if i["status"] == "in_progress" and i["tier"] == "main"]
     failed = [i["id"] for i in plan["items"] if i["status"] == "failed"]
+    easy = [i["id"] for i in plan["items"] if i.get("light") and i["status"] in ("todo", "in_progress")]
+    ready = [i for i in ready if i not in easy]
+    mains = [i for i in mains if i not in easy]
     parts = []
+    if easy:
+        parts.append(f"пункты без проверки {', '.join(easy)}: сделай и закрой plan_verify(item_ids=[...], "
+                     "note=\"что сделал и чем убедился\")")
     if ready:
         parts.append(f"готовы к старту {', '.join(ready)}: plan_run()")
     if mains and active:
@@ -67,11 +74,12 @@ def _tail(root: str, extra: str = "") -> str:
 
 # ───────────────────────── план ─────────────────────────
 
-def init(project_dir: str, title: str, goal: str, items, review="auto", track="auto", passport: dict | None = None) -> str:
+def init(project_dir: str, title: str, goal: str, items, review="auto", track="auto", passport: dict | None = None,
+         docs="auto") -> str:
     root = core.project_root(project_dir)
     if any(j["kind"] != "scout" for j in workers.active_jobs(root)):
         raise core.PlanError("В проекте ещё работают воркеры прошлого плана: plan_jobs(wait=true, mode=\"all\").")
-    plan = core.init(root, title, goal, items, review=review, track=track)
+    plan = core.init(root, title, goal, items, review=review, track=track, docs=docs)
     _prune(root)
     notes = core.advice(plan)
     sync = plane.sync(root, passport)
@@ -93,10 +101,10 @@ def _prune(root: str) -> None:
 
 
 def update(project_dir: str, add=None, changes=None, hold=None, title=None, goal=None, remove=None,
-           user_approval=None) -> str:
+           user_approval=None, branch=None) -> str:
     root = core.project_root(project_dir)
     plan = core.update(root, add=add, changes=changes, hold=hold, title=title, goal=goal, remove=remove,
-                       user_approval=user_approval)
+                       user_approval=user_approval, branch=branch)
     notes = [f"Замечание: {n}" for n in core.advice(plan)] if add or changes or remove else []
     return _tail(root, "\n".join(["План обновлён.", *notes, plane.sync(root)]).strip())
 
@@ -128,7 +136,7 @@ def skip(project_dir: str, item_id, reason: str, user_approval: str, item_ids=No
 
 # ───────────────────────── исполнение ─────────────────────────
 
-def _start_item(root: str, plan: dict, item: dict, fresh: bool) -> str:
+def _start_item(root: str, plan: dict, item: dict, fresh: bool, carry: str = "") -> str:
     """Стартует пункт: main — помечает в работе, воркер — запускает. Возвращает строку отчёта."""
     if item["tier"] == "main":
         core.set_status(root, item["id"], "in_progress", job="")
@@ -139,7 +147,7 @@ def _start_item(root: str, plan: dict, item: dict, fresh: bool) -> str:
               and str(prev[-1].get("reason", "")).startswith("проверки не прошли"))
     job = workers.spawn(
         root, "item", item["tier"], f"i{item['id']}",
-        workers.fix_prompt(item, last_ev) if resume else workers.item_prompt(plan, item), workers.SYS_CODE,
+        workers.fix_prompt(item, last_ev) if resume else workers.item_prompt(plan, item) + carry, workers.SYS_CODE,
         item_id=item["id"],
         resume_session=prev[-1]["session_id"] if resume else None,
         on_created=lambda j: core.set_status(root, item["id"], "in_progress", job=j["id"]))
@@ -158,6 +166,28 @@ def _finished_report(root: str, jobs: list[dict]) -> list[str]:
         else:
             lines.append(f"Пункт {job['item_id']}: {job['status']} — {v['reason']}\n  отчёт воркера: "
                          + (v["report"][:500].replace("\n", "\n  ") or "нет"))
+    return lines
+
+
+def _escalate(root: str, finished: list[dict]) -> list[str]:
+    """Пункт на младшей модели не прошёл проверки — без участия оркестратора перезапускается ярусом выше."""
+    lines = []
+    for job in finished:
+        if job["kind"] != "item" or job["status"] != "FAILED" or "BLOCKED" in str(job.get("reason", "")):
+            continue
+        was = job["tier"]
+        up = core.escalate(root, str(job["item_id"]))
+        if not up:
+            continue
+        plan = core.load(root)
+        item = core.find(plan, job["item_id"])
+        ev = item["evidence"][-1] if item["evidence"] else None
+        carry = ("\n\nПРЕДЫДУЩАЯ ПОПЫТКА младшей модели не прошла проверки, её правки остались в файлах — проверь "
+                 "их и доведи:\n" + core.fail_report(item, ev, 800)) if ev and not ev["passed"] else ""
+        try:
+            lines.append(f"Пункт {item['id']}: {was} не справился — повышен: " + _start_item(root, plan, item, True, carry))
+        except core.PlanError as exc:
+            lines.append(f"Пункт {item['id']}: повышен до {up}, старт отложен ({exc}) — plan_run(item_ids=[\"{item['id']}\"]).")
     return lines
 
 
@@ -194,6 +224,7 @@ def run(project_dir: str, item_ids=None, wait: bool | None = None, timeout: int 
     if refused:
         out.append("Не запущено: " + "; ".join(refused))
     out += _finished_report(root, finished)
+    out += _escalate(root, finished)
     live = [workers.view(j) for j in workers.active_jobs(root)]
     if live:
         out.append("Работают:\n" + workers.table(live))
@@ -213,12 +244,13 @@ def jobs(project_dir: str, wait: bool = False, mode: str = "any", timeout: int =
                     if j["status"] not in workers.ACTIVE]
     recent = [j for j in workers.list_jobs(root) if j["status"] in workers.ACTIVE or j["id"] in watched
               or time.time() - j.get("ended", 0) < 900]
-    out = _finished_report(root, finished) + [workers.table([workers.view(j) for j in recent[-10:]])]
     has_plan = core.load(root, required=False) is not None
+    out = _finished_report(root, finished) + (_escalate(root, finished) if has_plan else [])
+    out.append(workers.table([workers.view(j) for j in recent[-10:]]))
     return _tail(root, "\n".join(out)) if has_plan else "\n".join(out)
 
 
-def verify(project_dir: str, item_ids=None) -> str:
+def verify(project_dir: str, item_ids=None, note: str | None = None) -> str:
     root = core.project_root(project_dir)
     plan = core.load(root)
     busy = {str(j["item_id"]) for j in workers.active_jobs(root) if j.get("item_id")}
@@ -228,11 +260,15 @@ def verify(project_dir: str, item_ids=None) -> str:
         if clash:
             raise core.PlanError(f"Пункты {', '.join(clash)} ещё у воркеров — их проверит надзиратель. Жди plan_run().")
     else:
-        ids = [i["id"] for i in plan["items"] if i["status"] in ("in_progress", "failed") and i["id"] not in busy]
+        ids = [i["id"] for i in plan["items"] if i["id"] not in busy and
+               (i["status"] in ("in_progress", "failed") or (note and i.get("light") and i["status"] == "todo"))]
     if not ids:
         raise core.PlanError("Нечего проверять: нет пунктов в работе без воркера.")
     lines = []
-    for item, ev in core.verify_items(root, ids):
+    for item, ev in core.verify_items(root, ids, note=note):
+        if item.get("light"):
+            lines.append(f"Пункт {item['id']}: закрыт без проверки ({core.LIGHT[item['light']]}) — {ev['note'][:160]}")
+            continue
         lines.append(f"Пункт {item['id']}: PASS → done (лог {ev['log']})" if ev["passed"] else core.fail_report(item, ev))
     return _tail(root, "\n".join(lines + [plane.sync(root)]).strip())
 
@@ -467,11 +503,58 @@ def wiki_pages(project_dir: str, include_text: bool = False) -> str:
     return "\n".join(lines)
 
 
-def wiki_publish(project_dir: str, title: str, markdown: str, mode: str = "upsert", parent_title: str | None = None) -> str:
+def docs_prompt(root: str, plan: dict, title: str, notes, current: str) -> str:
+    parts = [f"СТРАНИЦА: {title}", f"ПЛАН: {plan['title']}\nЦЕЛЬ: {plan['goal']}", "ПУНКТЫ:"]
+    for it in plan["items"]:
+        ev = it["evidence"][-1] if it["evidence"] else None
+        proof = (f"без проверки ({core.LIGHT[it['light']]}): {it.get('done_note') or ''}" if it.get("light") else
+                 "проверки: " + "; ".join(core.check_label(c) for c in it["verify"])
+                 + (f" — {'PASS' if ev['passed'] else 'FAIL'}" if ev else ""))
+        parts.append(f"- {it['id']} [{it['status']}] {it['title']}\n  результат: {it['acceptance']}\n  файлы: "
+                     f"{', '.join(it['files']) or '—'}\n  {proof}")
+    reports = [f"- пункт {v['item']}: {v['report'][:1200]}" for v in map(workers.view, workers.list_jobs(root))
+               if v["kind"] == "item" and v["status"] == "DONE" and v["report"].strip()]
+    if reports:
+        parts.append("ОТЧЁТЫ ИСПОЛНИТЕЛЕЙ:\n" + "\n".join(reports[-12:]))
+    if isinstance(notes, (list, tuple)):
+        notes = "\n".join(f"- {n}" for n in notes if str(n).strip())
+    if isinstance(notes, str) and notes.strip():
+        parts.append("ЗАМЕТКИ ОРКЕСТРАТОРА (решения и грабли из разговора с пользователем):\n" + notes.strip()[:4000])
+    parts.append(git_summary(root, plan.get("base_rev") or "", cap=20000) or "Диффа нет (проект вне git): читай файлы пунктов.")
+    if current.strip():
+        parts.append("ТЕКУЩИЙ ТЕКСТ СТРАНИЦЫ (обнови его, а не пиши заново):\n" + current[:WIKI_TEXT_CAP])
+    return "\n\n".join(parts)
+
+
+def _write_docs(root: str, plan: dict, title: str, notes, client, collection: str, timeout: int, progress) -> tuple[str, str]:
+    """Страницу пишет дешёвый воркер по материалам плана; оркестратор получает ссылку и оглавление."""
+    current = ""
+    try:
+        found = outline.list_pages(client, collection, os.path.basename(root), include_text=True) or {"pages": []}
+        current = next((p.get("text") or "" for p in found["pages"] if p.get("title") == title), "")
+    except outline.OutlineError:
+        pass
+    job = workers.spawn(root, "docs", "docs", "docs", docs_prompt(root, plan, title, notes, current), workers.SYS_DOCS)
+    (job,) = workers.wait(root, [job["id"]], "all", timeout, progress) or (job,)
+    v = workers.view(job)
+    text = re.sub(r"^```(?:markdown|md)?\s*\n|\n```\s*$", "", v["report"].strip())
+    if job["status"] != "DONE" or len(text) < 200 or "## " not in text:
+        why = v["reason"] or "ответ не похож на страницу"
+        raise core.PlanError(f"Воркер документации не справился ({job['status']}: {why}). Повтори wiki_publish или "
+                             "передай markdown сам.")
+    workers.cleanup_session(job)
+    heads = [ln[3:].strip() for ln in text.splitlines() if ln.startswith("## ")]
+    return text, (f"Страницу написал воркер ({v['model']}, {v['sec']}s, ${v['cost']}), {len(text)} символов; "
+                  f"разделы: {', '.join(heads[:10])}.")
+
+
+def wiki_publish(project_dir: str, title: str, markdown: str | None = None, mode: str = "upsert",
+                 parent_title: str | None = None, notes=None, timeout: int = 600, progress=None) -> str:
     root = core.project_root(project_dir)
     if not isinstance(title, str) or len(title.strip()) < 3:
         raise core.PlanError("title обязателен: заголовок страницы.")
-    if not isinstance(markdown, str) or len(markdown.strip()) < 80:
+    auto = not (isinstance(markdown, str) and markdown.strip())
+    if not auto and len(markdown.strip()) < 80:
         raise core.PlanError("markdown слишком короткий: страница должна объяснять, что сделано, как устроено и как "
                              "проверять (≥ 80 символов).")
     if mode not in ("upsert", "append"):
@@ -481,6 +564,12 @@ def wiki_publish(project_dir: str, title: str, markdown: str, mode: str = "upser
         raise core.PlanError("Сначала закрой пункты плана: документация публикуется после последней проверки, "
                              "иначе она опишет не то, что получилось.")
     client, collection = _outline()
+    wrote = ""
+    if auto:
+        if plan is None:
+            raise core.PlanError("Без markdown страницу пишет воркер по материалам плана, а плана в проекте нет: "
+                                 "передай markdown.")
+        markdown, wrote = _write_docs(root, plan, title.strip(), notes, client, collection, timeout, progress)
     meta = plane.enrich_meta(root, plan)
     passport = (f"# {outline.root_title(os.path.basename(root))}\n\n- Назначение: {meta.get('features')}\n"
                 f"- Стек: {meta.get('stack')}\n- Путь: `{root}`\n- Деплой и проверка: {meta.get('deploy_rules')}\n")
@@ -494,7 +583,7 @@ def wiki_publish(project_dir: str, title: str, markdown: str, mode: str = "upser
     docs = [d for d in meta.get("outline_docs") or [] if d.get("url") != entry["url"]] + [entry]
     meta["outline_docs"] = docs
     plane.save_meta(root, meta)
-    head = f"Опубликовано ({res['mode']}): {res['title']} — {res['url']}"
+    head = f"Опубликовано ({res['mode']}): {res['title']} — {res['url']}" + (f"\n{wrote}" if wrote else "")
     if plan is None:
         return head
     core.record_publication(root, entry)
@@ -541,7 +630,8 @@ def finish(project_dir: str, summary: str, user_approval: str | None = None, for
         workers.cleanup_session(job)
     cost = sum(workers.view(j)["cost"] for j in workers.list_jobs(root))
     how = ("Закрыт как есть решением пользователя, проверки не гонялись." if force else
-           "Финальный прогон проверок прошёл."
+           ("Финальный прогон проверок прошёл." if core.recheckable(plan) else
+            "Проверок в плане нет: пункты закрыты записью.")
            + (" Гейты сняты решением пользователя: " + "; ".join(plan["user_override"]["gates"]) + "."
               if plan.get("user_override") else ""))
     lines = [f"План «{plan['title']}» закрыт: {core.counts(plan)}. {how} Воркеры за план: ${round(cost, 3)}.",
