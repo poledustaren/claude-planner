@@ -260,7 +260,7 @@ def normalize_check(c, where: str) -> dict:
         raise PlanError(f"{where}: проверка — строка-команда или объект с type.")
     kind = c.get("type")
     if not kind or kind in ("command", "bash", "shell"):
-        kind = ("cmd" if "cmd" in c else "file_exists" if "paths" in c
+        kind = ("node" if "cmd" in c and "server" in c else "cmd" if "cmd" in c else "file_exists" if "paths" in c
                 else "file_contains" if "path" in c and "pattern" in c else "http" if "url" in c else kind)
     contains = c.get("contains")
     if contains is not None and (not isinstance(contains, str) or not contains):
@@ -274,6 +274,13 @@ def normalize_check(c, where: str) -> dict:
             raise PlanError(f"{where}: команда {cmd!r} ничего не доказывает (true, echo, ls, exit 0, «|| true»). "
                             "Нужна реальная проверка: тесты, сборка, rg -q по результату, curl -fsS.")
         return {"type": "cmd", "cmd": cmd.strip(),
+                "timeout": _int(c.get("timeout"), DEFAULT_TIMEOUT, where, "timeout", 1, MAX_TIMEOUT),
+                "expect_exit": _int(c.get("expect_exit"), 0, where, "expect_exit"), **extra}
+    if kind == "node":
+        server, cmd = c.get("server"), c.get("cmd")
+        if not isinstance(server, str) or not server.strip() or not isinstance(cmd, str) or not cmd.strip():
+            raise PlanError(f"{where}: у node-проверки нужны server (узел devopsmcp) и cmd.")
+        return {"type": "node", "server": server.strip(), "cmd": cmd.strip(),
                 "timeout": _int(c.get("timeout"), DEFAULT_TIMEOUT, where, "timeout", 1, MAX_TIMEOUT),
                 "expect_exit": _int(c.get("expect_exit"), 0, where, "expect_exit"), **extra}
     if kind == "file_exists":
@@ -296,7 +303,7 @@ def normalize_check(c, where: str) -> dict:
             raise PlanError(f"{where}: у http-проверки нужен url с http:// или https://.")
         return {"type": "http", "url": url,
                 "expect_status": _int(c.get("expect_status"), 200, where, "expect_status", 100, 599), **extra}
-    raise PlanError(f"{where}: неизвестный type {kind!r}. Допустимо: cmd, file_exists, file_contains, http.")
+    raise PlanError(f"{where}: неизвестный type {kind!r}. Допустимо: cmd, node, file_exists, file_contains, http.")
 
 
 def normalize_tier(value, where: str) -> str:
@@ -373,7 +380,7 @@ def build_item(raw, item_id: str, root: str) -> dict:
                         "пересечений между параллельными воркерами).")
     touches_code = any(os.path.splitext(p)[1].lower() in CODE_EXT for p in
                        (f[4:] if f.startswith("new:") else f for f in files))
-    if touches_code and not light and not any(c["type"] in ("cmd", "http") for c in checks):
+    if touches_code and not light and not any(c["type"] in ("cmd", "http", "node") for c in checks):
         raise PlanError(f"{where}: пункт правит код, а проверки только смотрят, что файл есть. Добавь cmd "
                         "(тест, сборка, запуск) или http.")
     deps = raw.get("depends_on") or []
@@ -721,6 +728,19 @@ def run_check(root: str, c: dict) -> tuple[bool, str, str]:
         if "contains" in c and c["contains"] not in out:
             return False, f"в выводе нет {c['contains']!r}", out
         return True, f"exit {code}", out
+    if kind == "node":
+        from . import node  # узел опрашивается по сети, модуль нужен только этой проверке
+        try:
+            code, out = node.run(c["server"], c["cmd"], c["timeout"])
+        except node.NodeError as exc:
+            return False, str(exc), str(exc)
+        if code is None:
+            return False, f"узел {c['server']} не выполнил команду (профиль только для чтения)", out
+        if code != c["expect_exit"]:
+            return False, f"exit {code} вместо {c['expect_exit']}", out
+        if "contains" in c and c["contains"] not in out:
+            return False, f"в выводе нет {c['contains']!r}", out
+        return True, f"{c['server']}: exit {code}", out
     if kind == "file_exists":
         missing = [p for p in c["paths"] if not os.path.exists(os.path.join(root, p))]
         detail = f"нет файлов: {', '.join(missing)}" if missing else "файлы на месте"
@@ -743,6 +763,8 @@ def run_check(root: str, c: dict) -> tuple[bool, str, str]:
 
 
 def check_label(c: dict) -> str:
+    if c.get("type") == "node":
+        return f"{c['server']}: {c['cmd']}"[:160]
     return str(c.get("cmd") or c.get("url") or c.get("path") or ", ".join(c.get("paths", [])))[:160]
 
 

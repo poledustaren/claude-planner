@@ -25,7 +25,8 @@ ITEM = {
         "title": {"type": "string"},
         "acceptance": {"type": "string", "description": "Наблюдаемый результат, по которому видно, что сделано"},
         "verify": {"type": "array", "description": "Детерминированные проверки: строка-команда или объект "
-                   "{type:cmd,cmd,timeout?,contains?} | {type:file_contains,path,pattern} | "
+                   "{type:cmd,cmd,timeout?,contains?} | {type:node,server,cmd,contains?} — на узле через devopsmcp-ro | "
+                   "{type:file_contains,path,pattern} | "
                    "{type:file_exists,paths} | {type:http,url,expect_status?,contains?}", "items": {}},
         "tier": {"type": "string", "enum": list(core.TIERS),
                  "description": "main — сам; code-mini — Haiku (механика, при провале сам уходит на code-low); code-low — "

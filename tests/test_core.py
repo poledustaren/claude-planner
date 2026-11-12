@@ -1,7 +1,9 @@
 import os
 import unittest
+from unittest import mock
 
 from helpers import ProjectCase, core, item, plane
+from planner import node
 
 
 class Validation(ProjectCase):
@@ -294,3 +296,45 @@ class LightItems(ProjectCase):
     def test_mixed_plan_counts_only_checked_items_for_review(self):
         items = [item(f"Пункт {n}") for n in range(3)] + [{"title": "Заметка в README", "light": "nocode"}]
         self.assertFalse(core.needs_review(core.init(self.dir, "План", "цель плана достаточно длинная", items)))
+
+
+class NodeChecks(ProjectCase):
+    """Проверка на узле: результат инфраструктурного пункта живёт на сервере."""
+
+    CHECK = {"server": "vidak", "cmd": "grep -c b550 ~/infra/inventory.yaml", "contains": "1"}
+
+    def init(self, check=None):
+        return core.init(self.dir, "Инфра", "цель плана достаточно длинная",
+                         [item("Запись в инвентаре", verify=[check or self.CHECK], tier="main")])
+
+    def test_node_check_runs_on_the_node_and_judges_exit_and_output(self):
+        plan = self.init()
+        self.assertEqual(plan["items"][0]["verify"][0]["type"], "node")
+        calls = []
+
+        def fake(server, cmd, timeout=60):
+            calls.append((server, cmd))
+            return 0, "1\n"
+        with mock.patch.object(node, "run", fake):
+            (it, ev), = core.verify_items(self.dir, ["1"])
+        self.assertEqual(calls, [("vidak", "grep -c b550 ~/infra/inventory.yaml")])
+        self.assertTrue(ev["passed"])
+        self.assertEqual(self.status("1"), "done")
+
+    def test_refusal_or_dead_link_fails_the_check(self):
+        self.init()
+        with mock.patch.object(node, "run", lambda *a, **k: (None, "refused")):
+            (it, ev), = core.verify_items(self.dir, ["1"])
+        self.assertFalse(ev["passed"])
+        self.assertIn("не выполнил", core.fail_summary(ev))
+
+        def down(*a, **k):
+            raise node.NodeError("devopsmcp-ro недоступен")
+        with mock.patch.object(node, "run", down):
+            (it, ev), = core.verify_items(self.dir, ["1"])
+        self.assertEqual(it["status"], "failed")
+        self.assertIn("недоступен", core.fail_summary(ev))
+
+    def test_node_check_needs_server_and_cmd(self):
+        with self.assertRaises(core.PlanError):
+            self.init({"type": "node", "cmd": "hostname"})
