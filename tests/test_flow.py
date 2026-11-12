@@ -340,6 +340,78 @@ class PlaneAndWiki(ProjectCase):
         self.assertIn("Page проекта", self.pl.issues["i1"]["description_html"])
         self.assertIn("Критерий приёмки", self.pl.issues["i1"]["description_html"])
 
+    def hub_session(self, issue=None):
+        """Сессия запущена Agent Hub под задачу Plane: её id лежит в окружении."""
+        issue_id, project_id = "aaaaaaaa-0000-4000-8000-000000000001", "bbbbbbbb-0000-4000-8000-000000000002"
+        store = {"issue": issue if issue is not None else {
+            "id": issue_id, "sequence_id": 12, "name": "Задача владельца",
+            "description_html": "<p>Сделать, как просил владелец</p>", "assignees": ["claude-id"]}}
+        base, patches = self.pl, []
+
+        def transport(method, path, payload=None):
+            tail = path.split("/workspaces/ws/")[-1]
+            if tail == f"projects/{project_id}/work-items/{issue_id}/":
+                base.log.append((method, tail))
+                if method == "GET":
+                    if not store["issue"]:
+                        raise plane.PlaneError("HTTP 404")
+                    return dict(store["issue"])
+                patches.append(payload)
+                store["issue"] = {**store["issue"], **payload}
+                return dict(store["issue"])
+            if tail == f"projects/{project_id}/" and method == "GET":
+                return {"id": project_id, "identifier": "FERS"}
+            return base(method, path, payload)
+
+        plane.FACTORY = lambda: plane.Client("https://plane.test", "k", "ws", transport=transport)
+        env = {"PLANE_ISSUE_ID": issue_id, "PLANE_PROJECT_ID": project_id, "PLANE_ISSUE_KEY": "FERS-12"}
+        for k, v in env.items():
+            os.environ[k] = v
+        self.addCleanup(lambda: [os.environ.pop(k, None) for k in env])
+        return issue_id, project_id, patches
+
+    def test_plan_in_hub_session_adopts_its_issue_instead_of_creating_one(self):
+        issue_id, project_id, patches = self.hub_session()
+        out = flow.init(self.dir, "План", "функция a возвращает 42", [item()])
+        self.assertIn(f"Plane: FERS-12 (In Progress) https://plane.test/ws/projects/{project_id}/issues/{issue_id}", out)
+        self.assertEqual([x for x in self.pl.log if x == ("POST", "projects/p1/work-items/")], [])  # дубля нет
+        self.assertEqual(self.pl.issues, {})
+        first = patches[0]
+        self.assertNotIn("name", first)       # заголовок владельца не трогаем
+        self.assertNotIn("assignees", first)  # исполнителя тоже
+        self.assertEqual(first["state"], "s1")
+        self.assertTrue(first["description_html"].startswith("<p>Сделать, как просил владелец</p>"))
+        self.assertIn("Критерий приёмки", first["description_html"])
+        info = self.plan()["plane"]
+        self.assertEqual((info["issue_id"], info["project_id"], info["adopted"]), (issue_id, project_id, True))
+        plane.sync(self.dir)  # повторная синхронизация описание не наращивает
+        self.assertEqual(patches[-1]["description_html"].count("Сделать, как просил владелец"), 1)
+        self.assertEqual(patches[-1]["description_html"].count("Критерий приёмки"), first["description_html"].count("Критерий приёмки"))
+
+    def test_second_plan_of_hub_session_keeps_only_original_description(self):
+        _, _, patches = self.hub_session()
+        flow.init(self.dir, "План", "функция a возвращает 42", [item()])
+        with core.locked(self.dir):
+            plan = core.load(self.dir)
+            plan.pop("plane")
+            core.atomic_write(core.pdir(self.dir, "plan.json"), json.dumps(plan, ensure_ascii=False))
+        plane.sync(self.dir)  # новый план той же сессии подхватывает ту же задачу
+        html_ = patches[-1]["description_html"]
+        self.assertEqual(html_.count("<h2"), 1)
+        self.assertEqual(html_.count("Сделать, как просил владелец"), 1)
+
+    def test_light_plan_in_hub_session_is_tracked(self):
+        self.hub_session()
+        self.assertFalse(plane.tracked({"items": [{"light": "trivial"}], "track": False}))
+        out = flow.init(self.dir, "Мелочь", "опечатка в сообщении исправлена", [{"title": "Опечатка", "light": "trivial"}])
+        self.assertIn("FERS-12", out)
+
+    def test_missing_hub_issue_falls_back_to_own_issue(self):
+        self.hub_session(issue={})
+        out = flow.init(self.dir, "План", "функция a возвращает 42", [item()])
+        self.assertIn("TST-7", out)
+        self.assertNotIn("adopted", self.plan()["plane"])
+
     def test_passport_is_reused_and_not_rewritten_when_unchanged(self):
         flow.init(self.dir, "План", "функция a возвращает 42", [item()], passport={"stack": "Python 3.14"})
         writes = [x for x in self.pl.log if "pages" in x[1] and x[0] != "GET"]

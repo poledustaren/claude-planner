@@ -26,6 +26,11 @@ REVIEW_STATE_NAMES = ("в проверке", "in review", "review", "на про
 BOXES = {"done": "☑️", "todo": "⬜", "in_progress": "🔄", "failed": "❌", "skipped": "⏭️"}
 PASSPORT_KEYS = ("stack", "features", "deploy_rules", "links")
 FACTORY = None  # тесты подменяют на фабрику клиента с фейковым транспортом
+ENV_ISSUE, ENV_PROJECT, ENV_KEY = "PLANE_ISSUE_ID", "PLANE_PROJECT_ID", "PLANE_ISSUE_KEY"
+ID_RE = re.compile(r"[0-9a-fA-F-]{8,64}")
+PLAN_MARK = '<hr/><h2 data-cplan="1">План: '
+PLAN_MARK_RE = re.compile(r"<hr\s*/?>\s*<h2[^>]*>\s*План: ")
+ORIGIN_LIMIT = 20000  # исходное описание подхваченной задачи хранится в плане
 
 
 class PlaneError(Exception):
@@ -87,11 +92,54 @@ def client() -> Client | None:
     return Client(cfg["PLANE_BASE_URL"], cfg["PLANE_API_KEY"], cfg["PLANE_WORKSPACE_SLUG"])
 
 
+def env_issue() -> tuple[str, str] | None:
+    """Задача Plane, под которую запущена сессия: (project_id, issue_id) из окружения.
+
+    Agent Hub запускает сессию по задаче и кладёт её id в PLANE_ISSUE_ID / PLANE_PROJECT_ID:
+    план ведёт эту задачу, а не заводит вторую."""
+    issue, project = os.environ.get(ENV_ISSUE, "").strip(), os.environ.get(ENV_PROJECT, "").strip()
+    return (project, issue) if ID_RE.fullmatch(issue) and ID_RE.fullmatch(project) else None
+
+
 def tracked(plan: dict) -> bool:
     flag = plan.get("track", "auto")
     if flag in (True, False):
         return flag
-    return bool(core.heavy(plan)) or bool((plan.get("plane") or {}).get("issue_id"))  # чеклист из light в трекер не идёт
+    # чеклист из light в трекер не идёт — кроме сессии, запущенной под задачу: её статус ведёт план
+    return bool(core.heavy(plan)) or bool((plan.get("plane") or {}).get("issue_id")) or env_issue() is not None
+
+
+def adopt_issue(cl: Client, meta: dict, info: dict) -> dict | None:
+    """Подхватить задачу из окружения сессии: вернуть её как есть и запомнить в info.
+
+    Заголовок и исполнителей подхваченной задачи план не трогает, исходное описание остаётся
+    над чек-листом. Задачи нет (удалена) — None, план заведёт свою."""
+    target = env_issue()
+    if target is None:
+        return None
+    project_id, issue_id = target
+    try:
+        issue = cl.call("GET", cl.ws(f"projects/{project_id}/work-items/{issue_id}/")) or {}
+    except PlaneError:
+        return None
+    if not issue.get("id"):
+        return None
+    if not meta.get("plane_project_id"):  # папка ещё не привязана к проекту Plane — берём проект задачи
+        try:
+            proj = cl.call("GET", cl.ws(f"projects/{project_id}/")) or {}
+        except PlaneError:
+            proj = {}
+        if proj.get("id"):
+            meta["plane_project_id"] = str(proj["id"])
+            meta["plane_project_identifier"] = str(proj.get("identifier") or "PROJ")
+    # прошлый план этой же сессии уже дописал свой чек-лист под описание — берём только исходную часть
+    origin = PLAN_MARK_RE.split(str(issue.get("description_html") or ""), maxsplit=1)[0]
+    info.update(issue_id=str(issue["id"]), adopted=True, adopted_project=project_id,
+                sequence_id=issue.get("sequence_id"), origin_html=origin[:ORIGIN_LIMIT])
+    key = os.environ.get(ENV_KEY, "").strip()
+    if re.fullmatch(r"[A-Za-z0-9]{1,12}-\d{1,9}", key):
+        info["adopted_key"] = key
+    return issue
 
 
 # ───────────────────────── паспорт проекта ─────────────────────────
@@ -331,8 +379,13 @@ def sync(root: str, extra: dict | None = None) -> str:
         if cl is None:
             return "Plane не настроен (~/.config/claude-planner/plane.env) — задача и паспорт не заведены."
         meta = enrich_meta(root, plan, extra)
+        info = dict(plan.get("plane") or {})
+        if not info.get("issue_id"):
+            adopt_issue(cl, meta, info)
         project_id, ident = ensure_project(cl, root, meta)
-        states = ensure_states(cl, project_id, meta)
+        # подхваченная задача может жить в другом проекте, чем паспорт папки: статусы берём из её проекта
+        issue_project = str(info.get("adopted_project") or project_id)
+        states = ensure_states(cl, project_id, meta) if issue_project == project_id else ensure_states(cl, issue_project, {})
         save_meta(root, meta)
         docs = all_docs(plan, meta)
         if docs:
@@ -344,14 +397,18 @@ def sync(root: str, extra: dict | None = None) -> str:
         except PlaneError as exc:
             page_note = f" Паспорт не обновлён: {exc}."
         save_meta(root, meta)
-        info = dict(plan.get("plane") or {})
         finished = plan["status"] == "finished"
-        payload = {"name": plan["title"], "description_html": issue_html(plan, meta, page_url)}
+        body = issue_html(plan, meta, page_url)
+        if info.get("adopted"):
+            origin = info.get("origin_html") or ""
+            payload = {"description_html": f"{origin}{PLAN_MARK}{html.escape(plan['title'])}</h2>{body}" if origin else body}
+        else:
+            payload = {"name": plan["title"], "description_html": body}
         state = states.get("in_review") if finished else states.get("in_progress") or states.get("todo")
         if state:
             payload["state"] = str(state)
         if info.get("issue_id"):
-            issue = cl.call("PATCH", cl.ws(f"projects/{project_id}/work-items/{info['issue_id']}/"), payload) or {}
+            issue = cl.call("PATCH", cl.ws(f"projects/{issue_project}/work-items/{info['issue_id']}/"), payload) or {}
         else:
             if not meta.get("plane_user_id"):
                 meta["plane_user_id"] = str((cl.call("GET", "/api/v1/users/me/") or {}).get("id") or "")
@@ -363,8 +420,9 @@ def sync(root: str, extra: dict | None = None) -> str:
                 raise PlaneError("Plane не вернул id созданной задачи")
             info["issue_id"] = str(issue["id"])
         seq = issue.get("sequence_id") or info.get("sequence_id")
-        info.update(project_id=project_id, sequence_id=seq, issue_key=f"{ident}-{seq}" if seq else ident,
-                    issue_url=f"{cl.base_url}/{cl.workspace}/projects/{project_id}/issues/{info['issue_id']}",
+        key = info.get("adopted_key") or (f"{ident}-{seq}" if seq else ident)
+        info.update(project_id=issue_project, sequence_id=seq, issue_key=key,
+                    issue_url=f"{cl.base_url}/{cl.workspace}/projects/{issue_project}/issues/{info['issue_id']}",
                     page_url=page_url, state="В проверке" if finished else "In Progress")
         with core.locked(root):
             fresh = core.load(root)
