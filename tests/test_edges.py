@@ -52,6 +52,28 @@ class Hooks(ProjectCase):
         hook("track", {"session_id": "s2", "tool_name": "mcp__planner__plan_verify", "tool_input": {"project_dir": self.dir}})
         self.assertIn("plan_finish", hook("stop", {"session_id": "s2"})["reason"])
 
+    def test_stop_gate_ignores_plan_of_another_session(self):
+        def call(who, tool, **kw):
+            hook("track", {**who, "tool_name": "mcp__planner__" + tool, "tool_input": {"project_dir": self.dir}, **kw})
+
+        mine, other = {"session_id": "s3"}, {"session_id": "s4"}
+        core.init(self.dir, "Первый", "цель плана достаточно длинная", [item()])
+        call(mine, "plan_init")
+        call(other, "plan_show")
+        self.assertEqual(hook("stop", other), {})  # посмотреть чужой план — не значит вести его
+        call(other, "plan_init", tool_response={"isError": True, "content": [{"type": "text", "text": "отказ"}]})
+        self.assertEqual(hook("stop", other), {})  # отказ планера чужой план своим не делает
+        self.assertEqual(hook("stop", mine)["decision"], "block")
+        core.finish(self.dir, "план снят пользователем", user_approval="бросай", force=True)
+        core.init(self.dir, "Второй", "цель плана достаточно длинная", [item()])  # тот же каталог, соседняя сессия
+        call(other, "plan_init")
+        hook("prompt", mine)
+        call(mine, "plan_show")
+        self.assertEqual(hook("stop", mine), {})  # в каталоге уже чужой план
+        self.assertIn("открыты пункты 1", hook("stop", other)["reason"])
+        call(mine, "plan_verify")
+        self.assertEqual(hook("stop", mine)["decision"], "block")  # взялся менять план — теперь ведёшь его
+
     def test_subagent_gets_active_plan_and_rules(self):
         sub = os.path.join(self.dir, "pkg")
         os.makedirs(sub)

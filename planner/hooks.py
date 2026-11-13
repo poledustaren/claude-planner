@@ -300,6 +300,14 @@ def plan_gate(data: dict) -> dict:
 
 # ───────────────────────── track / prompt ─────────────────────────
 
+def refused(data: dict) -> bool:
+    """Планер отказал: неудачный вызов (plan_init поверх чужого плана) план своим не делает."""
+    resp = data.get("tool_response")
+    if isinstance(resp, dict) and (resp.get("isError") or resp.get("is_error")):
+        return True
+    return "уже есть незакрытый план" in json.dumps(resp, ensure_ascii=False, default=str)
+
+
 def track(data: dict) -> dict:
     if data.get("agent_id"):
         return {}
@@ -314,6 +322,11 @@ def track(data: dict) -> dict:
             roots = st.setdefault("roots", [])
             if root not in roots:
                 roots.append(root)
+            # Сессия ведёт план, только если сама его меняла; каталог делят и соседние сессии, поэтому
+            # запоминаем конкретный план (created_at), а не папку: чужой или следующий план в ней — не наш.
+            plan = read_plan(root)
+            if tool.rsplit("__", 1)[-1] in OWNER_TOOLS and not refused(data) and plan and plan.get("status") != "finished":
+                st.setdefault("plans", {})[root] = plan.get("created_at")
         st["turn"] = True
         st["ts"] = time.time()
         save_state(sid, st)
@@ -354,13 +367,15 @@ def prompt(data: dict) -> dict:
 def stop(data: dict) -> dict:
     sid = data.get("session_id") or ""
     st = load_state(sid)
-    if not st.get("turn") or not st.get("roots"):
+    if not st.get("turn") or not st.get("plans"):
         return {}
     reasons, digest = [], hashlib.sha1()
-    for root in st["roots"]:
+    for root, stamp in st["plans"].items():
         plan = read_plan(root)
         if not plan or plan.get("status") == "finished" or plan.get("hold"):
             continue
+        if plan.get("created_at") != stamp:
+            continue  # в папке уже другой план — его ведёт другая сессия
         jobs = active_jobs(root)
         items = plan.get("items") or []
         digest.update(json.dumps([plan.get("status"), [(i["id"], i["status"]) for i in items], sorted(jobs)]).encode())
