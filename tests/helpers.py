@@ -32,7 +32,7 @@ class ProjectCase(unittest.TestCase):
         subprocess.run("git add -A && git -c user.email=t@t -c user.name=t commit -qm init", shell=True,
                        cwd=self.dir, check=True)
         with open(os.path.join(self.dir, ".git", "info", "exclude"), "a", encoding="utf-8") as fh:
-            fh.write(".fake*\n")  # служебные файлы подставного claude — не правки проекта
+            fh.write(".fake*\n__pycache__/\n")  # служебные файлы подставного claude и байт-код проверок — не правки проекта
         self._env = {k: os.environ.get(k) for k in ("CPLAN_CLAUDE_BIN", "HOME", "CPLAN_SANDBOX", "CPLAN_ENV_SCRUB",
                                                      "CPLAN_VERIFY_DENY", "GITLAB_TOKEN", "DB_PASSWORD",
                                                      "ANTHROPIC_API_KEY", "CPLAN_PLAIN", "CI_JOB_JWT",
