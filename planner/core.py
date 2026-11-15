@@ -390,6 +390,8 @@ def normalize_check(c, where: str, trusted: bool = False) -> dict:
         path, words = c.get("path"), c.get("max_words")
         if not isinstance(path, str) or not path.strip():
             raise PlanError(f"{where}: у doc-проверки нужен path — страница документации в проекте.")
+        if os.path.isabs(path.strip()) or ".." in path.replace("\\", "/").split("/"):
+            raise PlanError(f"{where}: path у doc-проверки — относительный путь внутри проекта, без «..».")
         if words is not None:
             words = _int(words, 25, where, "max_words", 5, 60)
         return {"type": "doc", "path": path.strip(), **({"max_words": words} if words else {})}
@@ -686,7 +688,8 @@ def update(root: str, add=None, changes=None, hold=None, title=None, goal=None, 
                     raise PlanError(f"{book}: этапа {name!r} нет. Есть: {', '.join(s['name'] for s in stage_list) or '—'}.")
                 own = stages.items_of(plan, stage_list, st["name"])
                 if book == "stage_pass":
-                    if st["gate"] != "user":
+                    # Гейт review согласием не заменяется — кроме случая, когда приёмка этапа исчерпала раунды.
+                    if st["gate"] != "user" and not (st["gate"] == "review" and stages.review_stuck(plan, st["name"])):
                         raise PlanError(f"stage_pass: у этапа {st['name']} гейт {st['gate']}, согласием он не проходится"
                                         + (f" — нужна приёмка plan_review(stage=\"{st['name']}\")." if st["gate"] == "review"
                                            else "."))
@@ -697,7 +700,8 @@ def update(root: str, add=None, changes=None, hold=None, title=None, goal=None, 
                 elif not st["required_for"] or own:
                     raise PlanError(f"stage_skip: отказаться можно от обязательного этапа (required_for), у которого "
                                     f"нет пунктов; {st['name']} — не такой.")
-                plan.setdefault(book, {})[st["name"]] = {"by": "user", "user_approval": approval, "ts": now()}
+                plan.setdefault(book, {})[st["name"]] = {"by": "user", "user_approval": approval, "ts": now(),
+                                                         "conf": stages.digest(stage_list)}
                 event(plan, book, note=f"{st['name']} | согласие: {approval}")
         if branch is not None:
             cur = git_branch(root)

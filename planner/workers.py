@@ -8,6 +8,7 @@ review — приёмщик; docs — Haiku, пишет страницу док�
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -22,6 +23,7 @@ from . import core
 
 CONFIG_FILE = "~/.config/claude-planner/config.json"
 MAX_PARALLEL = 4
+_MCP_TOOL = re.compile(r"[A-Za-z0-9_.-]{1,80}$")
 MAX_FIX_ROUNDS = 1
 DEFAULT_TIERS = {
     "scout": {"model": "haiku", "effort": None, "mode": "read", "timeout": 300},
@@ -231,33 +233,63 @@ def edit_rules(job: dict) -> list[str]:
 
 
 def _stage(job: dict) -> dict | None:
-    """Этап пункта, которым занят воркер. Плана или пункта нет — этапа нет; битый cplan.json — ошибка: воркер
-    без ограничений своего этапа стартовать не должен."""
+    """Этап пункта, которым занят воркер. Воркер не по пункту (разведка, приёмка, вики) — этапа нет. План, пункт
+    или cplan.json не читаются — ошибка, а не «этапа нет»: без ограничений своего этапа воркер не стартует."""
     if not job.get("item_id"):
         return None
-    try:
-        item = core.find(core.load(job["root"]), job["item_id"])
-    except (KeyError, core.PlanError):
-        return None
     from . import stages
-    return stages.for_item(job["root"], item)
+    return stages.for_item(job["root"], core.find(core.load(job["root"]), job["item_id"]))
 
 
-def mcp_args(names: list[str]) -> tuple[list[str], list[str]]:
-    """MCP-серверы воркера: (--mcp-config …, правила allowedTools). Описания серверов — в config.json → mcp_servers,
-    их читает только планер: каталог конфига воркерам закрыт."""
+def mcp_rules(names: list[str], readonly: bool) -> tuple[dict, list[str]]:
+    """MCP-серверы воркера: (описания для --mcp-config, правила allowedTools).
+
+    Описания лежат в config.json → mcp_servers. Ключ "tools" в описании — перечень разрешённых инструментов сервера;
+    без него воркеру доступны все. Читающему воркеру (readonly) перечень обязателен: подсказка «только чтение» не
+    удержит сервер, у которого есть меняющие инструменты, а текст логов и ответов может уговаривать их вызвать."""
     from . import stages
-    known = stages.mcp_servers()
-    picked = {n: known[n] for n in names if isinstance(known.get(n), dict)}
-    if not picked:
-        return [], []
-    return ["--mcp-config", json.dumps({"mcpServers": picked}, ensure_ascii=False)], [f"mcp__{n}" for n in picked]
+    known, picked, allow = stages.mcp_servers(), {}, []
+    for name in names:
+        desc = known.get(name)
+        if not isinstance(desc, dict):
+            raise core.PlanError(f"MCP-сервера {name} нет в config.json → mcp_servers: скажи пользователю.")
+        tools = desc.get("tools")
+        if tools is None and readonly:
+            raise core.PlanError(f"MCP-серверу {name} для читающего воркера нужен перечень разрешённых инструментов: "
+                                 f"config.json → mcp_servers → {name} → \"tools\": [\"имя\", ...]. Без него сервер отдал "
+                                 "бы воркеру и меняющие инструменты. Скажи пользователю.")
+        if tools is not None and (not isinstance(tools, list) or not tools
+                                  or not all(isinstance(t, str) and _MCP_TOOL.match(t) for t in tools)):
+            raise core.PlanError(f"config.json → mcp_servers → {name} → tools: непустой список точных имён инструментов "
+                                 "сервера, без масок. Скажи пользователю.")
+        picked[name] = {k: v for k, v in desc.items() if k != "tools"}
+        allow += [f"mcp__{name}"] if tools is None else [f"mcp__{name}__{t}" for t in dict.fromkeys(tools)]
+    return picked, allow
+
+
+def mcp_file(picked: dict) -> str:
+    """Описание серверов для --mcp-config — файлом, а не аргументом: в нём бывают ключи, а командная строка видна
+    в списке процессов. Каталог конфига воркерам закрыт (SECRET_PATHS), имя файла — по содержимому."""
+    body = json.dumps({"mcpServers": picked}, ensure_ascii=False, sort_keys=True)
+    folder = os.path.join(os.path.dirname(os.path.expanduser(CONFIG_FILE)), "mcp")
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    path = os.path.join(folder, hashlib.sha256(body.encode("utf-8")).hexdigest()[:16] + ".json")
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as fh:
+        fh.write(body)
+    os.replace(tmp, path)
+    return path
+
+
+def mcp_args(names: list[str], readonly: bool = False) -> tuple[list[str], list[str]]:
+    picked, allow = mcp_rules(names, readonly)
+    return (["--mcp-config", mcp_file(picked)], allow) if picked else ([], [])
 
 
 def build_cmd(job: dict, resume: bool) -> list[str]:
     tier = tiers()[job["tier"]]
     stage = _stage(job)
-    mcp_flags, mcp_allow = mcp_args(job.get("mcp") or (stage["mcp"] if stage else []))
+    mcp_flags, mcp_allow = mcp_args(job.get("mcp") or (stage["mcp"] if stage else []), tier["mode"] == "read")
     cmd = [claude_bin(), "-p", "--model", tier["model"], "--setting-sources", "", "--strict-mcp-config",
            "--output-format", "stream-json", "--verbose", "--permission-mode", "dontAsk"]
     if tier.get("effort"):

@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
+import json
 import os
 import re
 
@@ -207,6 +209,19 @@ def items_of(plan: dict, stages: list[dict], name: str) -> list[dict]:
     return out
 
 
+def digest(stages: list[dict]) -> str:
+    """Отпечаток правил, от которых зависит согласие: состав и порядок этапов, их пути, гейты и обязательные проверки.
+
+    Запись о пройденном гейте или об отказе от этапа действует, пока эти правила те же: согласие давали под них."""
+    rules = [[s["name"], s["paths"], s["required_for"], s["gate"], s["verify"]] for s in stages]
+    return hashlib.sha256(json.dumps(rules, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+
+
+def _record(plan: dict, stages: list[dict], book: str, name: str) -> dict:
+    rec = (plan.get(book) or {}).get(name) or {}
+    return rec if rec.get("conf") == digest(stages) else {}
+
+
 def passed(plan: dict, stages: list[dict], st: dict) -> bool:
     """Гейт этапа пройден: его нет, прошла приёмка всего плана либо есть запись новее последнего закрытого пункта."""
     items = items_of(plan, stages, st["name"])
@@ -215,15 +230,36 @@ def passed(plan: dict, stages: list[dict], st: dict) -> bool:
     if st["gate"] == "review" and (core.review_approved(plan) or (
             core.needs_review(plan) and not any(i["status"] in core.OPEN for i in plan["items"]))):
         return True  # приёмка всего плана покрывает и этап: дважды одно и то же не принимаем
-    rec = (plan.get("stage_pass") or {}).get(st["name"]) or {}
+    rec = _record(plan, stages, "stage_pass", st["name"])
     return bool(rec) and rec.get("ts", "") >= max(i.get("closed_at") or "" for i in items)
 
 
-def gate_hint(st: dict) -> str:
-    if st["gate"] == "user":
-        return (f"этап {st['name']} закрыт, его гейт user не пройден: покажи пользователю результат этапа и "
+def review_rounds(plan: dict, name: str) -> list:
+    return ((plan.get("stage_reviews") or {}).get(name) or {}).get("rounds") or []
+
+
+def review_stuck(plan: dict, name: str) -> bool:
+    """Приёмка этапа отклонена столько раз, что дальше решает только пользователь."""
+    return sum(r.get("verdict") == "rejected" for r in review_rounds(plan, name)) >= core.MAX_REVIEW_ROUNDS
+
+
+def gate_hint(plan: dict, st: dict) -> str:
+    if st["gate"] == "user" or review_stuck(plan, st["name"]):
+        why = "его гейт user не пройден" if st["gate"] == "user" else "лимит раундов его приёмки исчерпан"
+        return (f"этап {st['name']} закрыт, {why}: покажи пользователю результат этапа и "
                 f"передай его согласие — plan_update(stage_pass=\"{st['name']}\", user_approval=<цитата>)")
     return f"этап {st['name']} закрыт, его приёмка не пройдена — plan_review(stage=\"{st['name']}\")"
+
+
+def proven(items: list[dict]) -> set[str]:
+    """Типы проверок, которые у пунктов этапа прошли на самом деле. Пункт, закрытый без проверки (skipped или принятый
+    пользователем), обязательный тип не даёт: его проверки не запускались."""
+    out = set()
+    for it in items:
+        ev = it["evidence"][-1] if it.get("evidence") else None
+        if it["status"] == "done" and not it.get("manual") and ev and ev.get("passed"):
+            out.update(c["type"] for c in ev.get("checks") or [] if c.get("passed"))
+    return out
 
 
 def incomplete(plan: dict, stages: list[dict], st: dict) -> str | None:
@@ -234,12 +270,16 @@ def incomplete(plan: dict, stages: list[dict], st: dict) -> str | None:
     opened = [i["id"] for i in items if i["status"] not in core.CLOSED]
     if opened:
         return f"ждёт этап {st['name']}: открыты пункты {', '.join(opened)}"
-    have = {c["type"] for i in items for c in i["verify"]}
+    have = proven(items)
     lack = [t for t in st["verify"] if t not in have]
     if lack:
-        return (f"этап {st['name']}: среди его пунктов нет проверки типа {', '.join(lack)} — добавь пункт с такой "
-                "проверкой plan_update(add=[...])")
-    return None if passed(plan, stages, st) else gate_hint(st)
+        return (f"этап {st['name']}: среди его пунктов нет пройденной проверки типа {', '.join(lack)} — добавь пункт "
+                "с такой проверкой plan_update(add=[...])")
+    return None if passed(plan, stages, st) else gate_hint(plan, st)
+
+
+CONFIG_MOVED = (f"{core.PROJECT_FILE} изменён после создания плана, а этапы задаёт пользователь: покажи ему разницу. "
+                "Согласен — plan_update(accept_config=true, user_approval=<цитата>)")
 
 
 def start_block(plan: dict, item: dict) -> str | None:
@@ -249,9 +289,12 @@ def start_block(plan: dict, item: dict) -> str | None:
     if not stages and not plan.get("staged"):
         return None
     if core.config_changed(root, plan):
-        return (f"{core.PROJECT_FILE} изменён после создания плана, а этапы задаёт пользователь: покажи ему разницу. "
-                "Согласен — plan_update(accept_config=true, user_approval=<цитата>)")
+        return CONFIG_MOVED
     name = of_item(stages, item)
+    mine = get(stages, name)
+    if mine and mine["tiers"] and item["tier"] not in mine["tiers"]:  # список тиров этапа могли сузить после создания пункта
+        return (f"этап {name} допускает тиры {', '.join(mine['tiers'])}, а у пункта {item['tier']}: смени тир — "
+                f"plan_update(update=[{{id: \"{item['id']}\", tier: ...}}])")
     order = [s["name"] for s in stages]
     files = core.file_paths(item)
     for st in stages:
@@ -262,15 +305,14 @@ def start_block(plan: dict, item: dict) -> str | None:
         if not earlier and not required:
             continue
         if not items_of(plan, stages, st["name"]):
-            if not required or (plan.get("stage_skip") or {}).get(st["name"]):
+            if not required or _record(plan, stages, "stage_skip", st["name"]):
                 continue
             return (f"файлы пункта требуют этапа {st['name']}: добавь пункт этого этапа plan_update(add=[...]) или "
                     f"передай отказ пользователя — plan_update(stage_skip=\"{st['name']}\", user_approval=<цитата>)")
         why = incomplete(plan, stages, st)
         if why:
             return why
-    st = get(stages, name)
-    lost = [m for m in (st["mcp"] if st else []) if m not in mcp_servers()]
+    lost = [m for m in (mine["mcp"] if mine else []) if m not in mcp_servers()]
     if lost:
         return (f"этапу {name} нужен MCP-сервер {', '.join(lost)}, а в config.json → mcp_servers его нет: скажи "
                 "пользователю")
@@ -310,9 +352,12 @@ def strays(plan: dict, stages: list[dict]) -> list[str]:
 
 def pending(plan: dict) -> list[str]:
     """Что не закрыто по этапам к моменту закрытия плана."""
-    stages = load(plan.get("root") or "")
-    if not stages:
+    root = plan.get("root") or ""
+    stages = load(root)
+    if not stages and not plan.get("staged"):
         return []
+    if core.config_changed(root, plan):  # этапы убрали или поменяли: по новому файлу план идёт только с согласия
+        return [CONFIG_MOVED]
     return [why for st in stages if (why := incomplete(plan, stages, st))] + strays(plan, stages)
 
 

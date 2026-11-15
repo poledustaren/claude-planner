@@ -27,7 +27,10 @@ def _update(job: dict, **fields) -> dict:
 def run_claude(job: dict, prompt: str, resume: bool) -> str | None:
     """Запускает одну сессию. Возвращает None при успехе или причину провала."""
     jdir = os.path.join(workers.jobs_dir(job["root"]), job["id"])
-    cmd = workers.build_cmd(job, resume)
+    try:
+        cmd = workers.build_cmd(job, resume)
+    except core.PlanError as exc:  # план, этап или MCP-сервер не читаются: без их ограничений воркер не стартует
+        return f"воркер не запущен: {exc}"
     with open(os.path.join(jdir, "stream.jsonl"), "ab") as out, open(os.path.join(jdir, "stderr.txt"), "ab") as err:
         try:
             proc = subprocess.Popen(cmd, cwd=job["root"], stdin=subprocess.PIPE, stdout=out, stderr=err,

@@ -367,6 +367,7 @@ def _profile(name: str | None) -> tuple[str, str, list[str]]:
     if lost:
         raise core.PlanError(f"Профилю {name} нужен MCP-сервер {', '.join(lost)}, а в config.json → mcp_servers его "
                              "нет: скажи пользователю.")
+    workers.mcp_rules(mcp, readonly=True)  # читающему воркеру — только перечисленные инструменты сервера
     return tier, workers.SYS_INCIDENT if name == "incident" else workers.SYS_SCOUT, mcp
 
 
@@ -482,6 +483,8 @@ def _collect_review(root: str, job: dict, stage: str | None = None) -> str:
         rev = plan.setdefault("review", {}) if stage is None else \
             plan.setdefault("stage_reviews", {}).setdefault(stage, {})
         rev.pop("job", None)
+        # Вердикт относится к тому, что приёмщик видел на старте: пункт, закрытый позже, им не принят.
+        asked = rev.pop("asked_at", None) or core.now()
         if job["status"] != "DONE" or data is None:
             core.event(plan, "review_error", note=v["reason"] or "нет структурного вердикта")
             return (f"Приёмщик не дал вердикт ({job['status']}: {v['reason'] or 'ответ не по схеме'}). Раунд не "
@@ -492,9 +495,12 @@ def _collect_review(root: str, job: dict, stage: str | None = None) -> str:
         rounds = rev.setdefault("rounds", [])
         rounds.append({"n": len(rounds) + 1, "ts": core.now(), "job": job["id"], "verdict": verdict, "issues": issues})
         if verdict == "approved":
-            rev["approved_at"] = core.now()
+            rev["approved_at"] = asked
             if stage is not None:
-                plan.setdefault("stage_pass", {})[stage] = {"by": "review", "job": job["id"], "ts": core.now()}
+                plan.setdefault("stage_pass", {})[stage] = {"by": "review", "job": job["id"], "ts": asked,
+                                                            "conf": stages.digest(stages.load(root))}
+        elif stage is not None:
+            (plan.get("stage_pass") or {}).pop(stage, None)  # отклонение новее любого прежнего прохода гейта
         core.event(plan, ("review_" if stage is None else "stage_review_") + verdict, note=stage or "")
     workers.cleanup_session(job)
 
@@ -526,6 +532,16 @@ def _stage_review(root: str, stage: str, wait: bool, timeout: int, notes, screen
                                  f"{', '.join(opened) or 'пунктов этапа нет'}.")
         if stages.passed(plan, stage_list, st):
             raise core.PlanError(f"Гейт этапа {st['name']} уже пройден, после него пункты этапа не менялись.")
+        rounds = stages.review_rounds(plan, st["name"])
+        if stages.review_stuck(plan, st["name"]):
+            raise core.PlanError(f"Приёмка этапа {st['name']} отклонена {len(rounds)} раз — лимит раундов исчерпан: "
+                                 "покажи пользователю блокеры и спроси решение. Он принимает этап как есть — "
+                                 f"plan_update(stage_pass=\"{st['name']}\", user_approval=<цитата>).")
+        if rounds and rounds[-1]["verdict"] == "rejected" and not (notes or "").strip() \
+                and rounds[-1]["ts"] >= max(i.get("closed_at") or "" for i in own):
+            raise core.PlanError(f"Приёмка этапа {st['name']} отклонена, и пункты этапа после этого не менялись: под "
+                                 "каждый блокер добавь пункт доработки plan_update(add=[...]) со своей проверкой либо "
+                                 f"оспорь — plan_review(stage=\"{st['name']}\", notes=...).")
         ids = {i["id"] for i in own}
         done_ids = [i for i in core.recheckable(plan) if i in ids]
         broken = [(it, ev) for it, ev in core.verify_items(root, done_ids, by="review", recheck=True)
@@ -533,12 +549,12 @@ def _stage_review(root: str, stage: str, wait: bool, timeout: int, notes, screen
         if broken:
             raise core.PlanError("Перед приёмкой этапа проверки прогнаны заново — есть регрессия, пункты вернулись "
                                  "в failed:\n" + "\n".join(core.fail_report(it, ev, 600) for it, ev in broken))
-        plan = core.load(root)
+        plan, asked = core.load(root), core.now()
         job = workers.spawn(root, "review", "review", f"review-{st['name']}",
                             review_prompt(plan, notes, screenshots, stage=st["name"], only=ids),
                             workers.SYS_REVIEW, schema=workers.REVIEW_SCHEMA)
         with core.mutate(root) as plan:
-            plan.setdefault("stage_reviews", {}).setdefault(st["name"], {})["job"] = job["id"]
+            plan.setdefault("stage_reviews", {}).setdefault(st["name"], {}).update(job=job["id"], asked_at=asked)
             core.event(plan, "stage_review_start", note=st["name"])
     if job["status"] in workers.ACTIVE:
         if not wait:
@@ -581,11 +597,11 @@ def review(project_dir: str, wait: bool = True, timeout: int = 900, notes: str |
             raise core.PlanError("Приёмку не запускаю: " + why + ". Почини пунктом плана (plan_update(add=[...])) и "
                                  "повтори plan_review. Красно не из-за этого плана — решает пользователь: "
                                  "plan_finish(summary, user_approval=<цитата>, waive=[\"baseline\", \"review\"]).")
-        plan = core.load(root)
+        plan, asked = core.load(root), core.now()
         job = workers.spawn(root, "review", "review", "review", review_prompt(plan, notes, screenshots),
                             workers.SYS_REVIEW, schema=workers.REVIEW_SCHEMA)
         with core.mutate(root) as plan:
-            plan.setdefault("review", {})["job"] = job["id"]
+            plan.setdefault("review", {}).update(job=job["id"], asked_at=asked)
             core.event(plan, "review_start")
     if job["status"] in workers.ACTIVE:
         if not wait:
@@ -703,12 +719,18 @@ def wiki_publish(project_dir: str, title: str, markdown: str | None = None, mode
                                  "передай markdown.")
         markdown, wrote = _write_docs(root, plan, title.strip(), notes, client, collection, timeout, progress,
                                       pattern or "")
-    if pattern:  # страница по шаблону: проверяем правила автора, в вики уходит текст без шапки и служебного комментария
+    if pattern:  # страница по шаблону: с замечаниями в вики не уходит; уходит без шапки и служебного комментария
         from . import doclint
-        flaws = doclint.lint(markdown)
-        wrote = (wrote + "\n" if wrote else "") + (
-            "Проверка страницы по шаблону: замечаний нет." if not flaws else
-            "Проверка страницы по шаблону — замечания (поправь и опубликуй заново):\n" + "\n".join(f"- {f}" for f in flaws))
+        flaws = doclint.lint(markdown, root=root, template=pattern)
+        if flaws:
+            draft = ""
+            if auto:  # работу воркера не теряем: черновик остаётся в каталоге плана
+                rel = os.path.join(core.DIR, "docs", core.slugify(title) + ".md")
+                core.atomic_write(os.path.join(root, rel), markdown)
+                draft = f"\nЧерновик воркера лежит в {rel}: поправь его и передай текст в markdown."
+            raise core.PlanError(f"Страница не опубликована — по шаблону {template} к ней есть замечания:\n"
+                                 + "\n".join(f"- {f}" for f in flaws) + draft)
+        wrote = (wrote + "\n" if wrote else "") + "Проверка страницы по шаблону: замечаний нет."
         markdown = doclint.publishable(markdown)
     meta = plane.enrich_meta(root, plan)
     passport = (f"# {outline.root_title(os.path.basename(root))}\n\n- Назначение: {meta.get('features')}\n"
