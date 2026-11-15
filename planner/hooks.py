@@ -4,7 +4,8 @@
   read_cap  PreToolUse(Read)            — не читать большой файл кода целиком
   subagent  SubagentStart               — встроенный субагент получает действующий план и правила работы в нём
   agent_gate PreToolUse(planner)        — субагент план не меняет и пункты не закрывает: это делает основная сессия
-  plan_gate PreToolUse(Edit|Write…)     — правка файла проекта только при открытом плане; вес плана выбирает модель
+  plan_gate PreToolUse(Edit|Write…)     — правка файла проекта только при открытом плане; вес плана выбирает модель;
+                                          cplan.json (базовые проверки проекта) модель не правит никогда
   track     PostToolUse(planner|Edit…)  — помнить, какие планы ведёт сессия; разовая подсказка про план
   prompt    UserPromptSubmit            — новый ход пользователя: сбросить счётчики
   stop      Stop                        — не бросать план, который вели в этом ходу
@@ -34,6 +35,7 @@ BRIEF_CAP = 4000
 PLAN_GATE = (os.environ.get("CPLAN_PLAN_GATE", "1") or "0") != "0"
 PROJECT_DIRS = (os.environ.get("CPLAN_PROJECT_DIRS") or "~/projects:~/work:/mnt/datadisk/Projects").split(":")
 SELF = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))  # планер правят напрямую: сам себя он не гейтит
+PROJECT_FILE = "cplan.json"  # базовые проверки проекта: файл правит только пользователь
 
 
 def state_path(session_id: str) -> str:
@@ -267,6 +269,11 @@ def plan_gate(data: dict) -> dict:
         return {}
     path = os.path.realpath(os.path.join(str(data.get("cwd") or ""), os.path.expanduser(path)))
     own = os.path.join(os.path.realpath(os.path.expanduser("~")), ".claude") + os.sep  # память, настройки, скиллы
+    if os.path.basename(path) == PROJECT_FILE and project_root(path) == os.path.dirname(path):
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": f"{PROJECT_FILE} задаёт базовые проверки проекта, "
+                                       "его правит только пользователь. Нужна другая проверка — предложи её "
+                                       "пользователю текстом. Через Bash запрет не обходи."}}
     if path.startswith((own, SELF + os.sep)) or "/.cplan/" in path:
         return {}
     if "/.claude/" in path and "/.claude/worktrees/" not in path:

@@ -223,6 +223,19 @@ def do_check() -> int:
     tools = len(re.findall(r'"name": "(?:plan|wiki)_', res.stdout))
     checks.append((f"сервер отвечает, инструментов {tools}", tools == 13))
     checks.append(("claude в PATH", shutil.which("claude") is not None))
+    try:
+        box = (read_json(os.path.expanduser("~/.config/claude-planner/config.json")).get("sandbox") or {})
+    except (OSError, ValueError, AttributeError):
+        box = {}
+    if os.environ.get("CPLAN_SANDBOX") == "0" or (isinstance(box, dict) and box.get("enabled") is False):
+        checks.append(("песочница воркеров выключена настройкой", True))
+    elif sys.platform.startswith("linux"):
+        ready = all(shutil.which(tool) for tool in ("bwrap", "socat"))
+        checks.append(("песочница воркеров: bubblewrap и socat на месте" if ready else
+                       "песочница воркеров: нет bubblewrap или socat (apt install bubblewrap socat) — воркеры идут без изоляции",
+                       ready))
+    else:
+        checks.append(("песочница воркеров: встроенная в систему", True))
     for name, ok in checks:
         print(("OK   " if ok else "FAIL ") + name)
     return 0 if all(ok for _, ok in checks) else 1

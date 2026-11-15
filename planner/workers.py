@@ -45,6 +45,20 @@ SCRUB_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "
              "CLAUDE_PID", "CLAUDE_JOB_DIR", "CLAUDE_EFFORT", "CLAUDE_CODE_MESSAGING_SOCKET",
              "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_EXECPATH",
              "CLAUDE_CODE_PLUGIN_DIRS")  # последнее — чтобы панель прогресса не грузилась в воркеров
+# Имена переменных окружения, похожие на секрет: воркеру они не нужны, а утечь через Bash могут.
+SECRET_ENV = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|ACCESS_KEY|API_?KEY|_KEYS?$|_PAT$|_DSN$|"
+                        r"DATABASE_URL|CONNECTION_?STRING", re.I)
+KEEP_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")  # аутентификация самого claude
+# Реквизиты на диске: закрыты и для Read (правила запрета), и для Bash (denyRead песочницы).
+SECRET_PATHS = ("~/.ssh", "~/.aws", "~/.kube", "~/.gnupg", "~/.docker/config.json", "~/.netrc", "~/.npmrc", "~/.pypirc",
+                "~/.git-credentials", "~/.config/gh", "~/.config/gcloud", "~/.config/claude-planner",
+                "~/.config/agy-planner", "~/.vault-token", "~/.claude/.credentials.json", "~/.claude.json")
+# Кэши сборщиков вне проекта: без записи туда не соберутся dotnet, npm, cargo, gradle.
+CACHE_PATHS = ("~/.cache", "~/.npm", "~/.nuget", "~/.dotnet", "~/.local/share/NuGet", "~/.cargo", "~/.gradle", "~/.m2",
+               "~/go/pkg")
+SANDBOX_NOTE = ("Bash работает в песочнице: писать можно только в проект и кэши сборки, сеть закрыта, кроме разрешённых "
+                "адресов. Команда упала из-за сети или доступа, а не из-за кода — окружение не чини и не обходи: "
+                "напиши об этом в отчёте, проверки пункта перезапустит надзиратель вне песочницы.")
 
 COMMON_RULES = (
     "Локализуй до чтения: rg -n, затем Read с offset/limit. Файл длиннее 400 строк целиком не читай. "
@@ -119,6 +133,38 @@ def tiers() -> dict:
     return out
 
 
+def _strs(value) -> list[str]:
+    return [v for v in value if isinstance(v, str) and v] if isinstance(value, list) else []
+
+
+def _sandbox_conf() -> dict:
+    conf = core.config().get("sandbox")
+    return conf if isinstance(conf, dict) else {}
+
+
+def sandbox() -> dict | None:
+    """Блок sandbox для --settings воркера; None — выключена (CPLAN_SANDBOX=0 или {"sandbox": {"enabled": false}}).
+
+    Песочница Claude Code изолирует только Bash: запись — в проект и кэши сборки, сеть — по списку доменов (по умолчанию
+    пусто), реквизиты из SECRET_PATHS не читаются. Права не раздаёт сама (autoAllowBashIfSandboxed=false): читающим
+    тирам по-прежнему доступен только перечень READ_BASH. Без bubblewrap/socat на Linux Claude Code предупреждает и
+    работает без песочницы; {"sandbox": {"strict": true}} превращает это в отказ запуска."""
+    conf = _sandbox_conf()
+    if os.environ.get("CPLAN_SANDBOX") == "0" or conf.get("enabled") is False:
+        return None
+    return {"enabled": True, "autoAllowBashIfSandboxed": False, "allowUnsandboxedCommands": False,
+            "failIfUnavailable": bool(conf.get("strict")),
+            "filesystem": {"allowWrite": _strs(conf["write"]) if isinstance(conf.get("write"), list) else list(CACHE_PATHS),
+                           "denyRead": [*SECRET_PATHS, *_strs(conf.get("deny_read"))]},
+            "network": {"allowedDomains": _strs(conf.get("domains"))}}
+
+
+def secret_rules() -> list[str]:
+    """Запрет Read на реквизиты: встроенные файловые инструменты идут мимо песочницы Bash."""
+    paths = [*SECRET_PATHS, *_strs(_sandbox_conf().get("deny_read"))]
+    return [rule for p in paths for rule in (f"Read({p})", f"Read({p}/**)")]
+
+
 def claude_bin() -> str:
     return os.environ.get("CPLAN_CLAUDE_BIN") or shutil.which("claude") or "claude"
 
@@ -150,21 +196,35 @@ def build_cmd(job: dict, resume: bool) -> list[str]:
     cmd += ["--resume", job["session_id"]] if resume else ["--session-id", job["session_id"]]
     if tier["mode"] == "read":
         cmd += ["--tools", "Read,Grep,Glob,Bash",
-                "--allowedTools", "Read", "Grep", "Glob", *[f"Bash({c}:*)" for c in READ_BASH]]
+                "--allowedTools", "Read", "Grep", "Glob", *[f"Bash({c}:*)" for c in READ_BASH],
+                "--disallowedTools", *secret_rules()]
     else:
         cmd += ["--tools", "Read,Grep,Glob,Bash,Edit,Write",
                 "--allowedTools", "Read", "Grep", "Glob", "Bash", *edit_rules(job),
-                "--disallowedTools", *[f"Bash({c}:*)" for c in DENY_BASH]]
+                "--disallowedTools", *[f"Bash({c}:*)" for c in DENY_BASH], *secret_rules()]
     guard = {"hooks": {"PreToolUse": [{"matcher": "Read", "hooks": [
         {"type": "command", "command": f"{sys.executable} {hooks_script()} read_cap", "timeout": 5}]}]}}
-    cmd += ["--settings", json.dumps(guard), "--system-prompt", job["system"]]
+    box = sandbox()
+    if box:
+        guard["sandbox"] = box
+    cmd += ["--settings", json.dumps(guard), "--system-prompt", job["system"] + ("\n" + SANDBOX_NOTE if box else "")]
     if job.get("schema"):
         cmd += ["--json-schema", json.dumps(job["schema"])]
     return cmd
 
 
 def child_env() -> dict:
+    """Окружение воркера без секретов родителя: имена, похожие на токен или пароль, вырезаются.
+
+    Остаются KEEP_ENV (ими аутентифицируется сам claude), реквизиты облака при Bedrock/Vertex и имена из
+    {"worker_env_keep": [...]} конфига. CPLAN_ENV_SCRUB=0 — передать всё как есть."""
     env = {k: v for k, v in os.environ.items() if k not in SCRUB_ENV}
+    if os.environ.get("CPLAN_ENV_SCRUB") != "0":
+        keep = {*KEEP_ENV, *_strs(core.config().get("worker_env_keep"))}
+        cloud = (("AWS_",) if env.get("CLAUDE_CODE_USE_BEDROCK") else ()) \
+            + (("GOOGLE_", "CLOUD_ML_", "ANTHROPIC_VERTEX_") if env.get("CLAUDE_CODE_USE_VERTEX") else ())
+        env = {k: v for k, v in env.items()
+               if k in keep or (cloud and k.startswith(cloud)) or not SECRET_ENV.search(k)}
     env["CPLAN_WORKER"] = "1"
     return env
 
@@ -428,9 +488,48 @@ def telemetry(root: str, job_id: str, trail: int = 0) -> dict:
     return t
 
 
+def _covers(allowed: list[str], rel: str) -> bool:
+    """Файл rel назван в списке сам или лежит в каталоге, заявленном целиком («путь/»)."""
+    return any(rel == a.rstrip("/") or rel.startswith(a.rstrip("/") + "/") for a in allowed)
+
+
 def out_of_scope(item: dict, touched: list[str]) -> list[str]:
-    allowed = set(core.file_paths(item))
-    return [p for p in touched if p not in allowed] if allowed else []
+    allowed = core.file_paths(item)
+    return [p for p in touched if not _covers(allowed, p)] if allowed else []
+
+
+def tree_state(root: str) -> dict | None:
+    """Снимок изменённых и новых файлов рабочего дерева: путь → (код статуса git, mtime, размер). None — не git."""
+    try:
+        res = subprocess.run(["git", "-C", root, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+                              "--no-renames"], capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    state = {}
+    for rec in res.stdout.decode("utf-8", "replace").split("\0"):
+        if len(rec) < 4:
+            continue
+        rel = rec[3:]
+        try:
+            st = os.stat(os.path.join(root, rel))
+            state[rel] = (rec[:2], st.st_mtime_ns, st.st_size)
+        except OSError:
+            state[rel] = (rec[:2], None, None)
+    return state
+
+
+def drift(plan: dict, item: dict, before: dict | None, after: dict | None, touched: list[str]) -> list[str]:
+    """Файлы, которые изменились за время работы воркера, но не заявлены ни в одном пункте плана.
+
+    Ловит запись в обход Edit/Write — через Bash, которую не видно в событиях инструментов. Автор не доказан:
+    тем же окном могли править соседний воркер или основная сессия, поэтому это предупреждение, а не отказ."""
+    if before is None or after is None:
+        return []
+    claimed = [f for it in plan["items"] for f in core.file_paths(it)]
+    changed = [p for p, sig in after.items() if before.get(p) != sig] + [p for p in before if p not in after]
+    return sorted(p for p in dict.fromkeys(changed) if not _covers(claimed, p) and p not in touched)
 
 
 def view(job: dict, trail: int = 0) -> dict:
@@ -441,7 +540,8 @@ def view(job: dict, trail: int = 0) -> dict:
             "sec": int(end - job.get("started", end)), "steps": t["steps"], "last": t["last"],
             "out_tokens": t["out_tokens"], "ctx": t["ctx"], "cost": round(t["cost"], 4),
             "fix_round": job.get("fix_round", 0), "touched": t["touched"],
-            "out_of_scope": job.get("out_of_scope") or [], "report": t["text"], "structured": t["structured"],
+            "out_of_scope": job.get("out_of_scope") or [], "drift": job.get("drift") or [],
+            "report": t["text"], "structured": t["structured"],
             "trail": t["trail"]}
 
 
@@ -456,7 +556,8 @@ def table(views: list[dict]) -> str:
                     + (f" (доработка {v['fix_round']})" if v["fix_round"] else "")
                     + f" | {v['sec']}s, шагов {v['steps']}, ctx {v['ctx'] // 1000}k, ${v['cost']}"
                     + (f" | {tail[:100]}" if tail else "")
-                    + (f" | ВНЕ ПУНКТА: {', '.join(v['out_of_scope'][:4])}" if v["out_of_scope"] else ""))
+                    + (f" | ВНЕ ПУНКТА: {', '.join(v['out_of_scope'][:4])}" if v["out_of_scope"] else "")
+                    + (f" | ВНЕ ПЛАНА: {', '.join(v['drift'][:4])}" if v["drift"] else ""))
     return "\n".join(rows)
 
 

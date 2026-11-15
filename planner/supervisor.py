@@ -62,8 +62,17 @@ def supervise(job: dict) -> None:
     prompt, resume = job["prompt"], bool(job.get("resume"))
     while True:
         job = _update(job, status="RUNNING", pid=os.getpid())
+        before = workers.tree_state(root) if item_id else None
         failure = run_claude(job, prompt, resume)
         tel = workers.telemetry(root, job["id"])
+        if item_id:
+            try:
+                plan_now = core.load(root)
+                seen = workers.drift(plan_now, core.find(plan_now, item_id), before, workers.tree_state(root),
+                                     tel["touched"])
+            except (KeyError, core.PlanError):
+                seen = []
+            job = _update(job, drift=sorted({*(job.get("drift") or []), *seen}))
         if failure:
             _update(job, status="FAILED", reason=failure, ended=time.time())
             if item_id:

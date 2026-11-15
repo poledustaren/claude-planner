@@ -31,7 +31,13 @@ class ProjectCase(unittest.TestCase):
         self.write("b.py", "def b():\n    return 2\n")
         subprocess.run("git add -A && git -c user.email=t@t -c user.name=t commit -qm init", shell=True,
                        cwd=self.dir, check=True)
-        self._env = {k: os.environ.get(k) for k in ("CPLAN_CLAUDE_BIN", "HOME")}
+        with open(os.path.join(self.dir, ".git", "info", "exclude"), "a", encoding="utf-8") as fh:
+            fh.write(".fake*\n")  # служебные файлы подставного claude — не правки проекта
+        self._env = {k: os.environ.get(k) for k in ("CPLAN_CLAUDE_BIN", "HOME", "CPLAN_SANDBOX", "CPLAN_ENV_SCRUB",
+                                                     "CPLAN_VERIFY_DENY", "GITLAB_TOKEN", "DB_PASSWORD",
+                                                     "ANTHROPIC_API_KEY", "CPLAN_PLAIN")}
+        for name in ("CPLAN_SANDBOX", "CPLAN_ENV_SCRUB", "CPLAN_VERIFY_DENY"):
+            os.environ.pop(name, None)
         os.environ["CPLAN_CLAUDE_BIN"] = FAKE
         self.home = tempfile.mkdtemp(prefix="cplan-home-")
         os.environ["HOME"] = self.home  # конфиги, кэш хуков и сессии — в песочнице
@@ -57,6 +63,16 @@ class ProjectCase(unittest.TestCase):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
+
+    def config(self, data):
+        path = os.path.join(self.home, ".config", "claude-planner", "config.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+
+    def git(self, *args):
+        return subprocess.run(["git", "-C", self.dir, "-c", "user.email=t@t", "-c", "user.name=t", *args],
+                              capture_output=True, text=True, check=True).stdout
 
     def scenario(self, data):
         self.write(".fake.json", json.dumps(data, ensure_ascii=False))

@@ -3,7 +3,8 @@
 
 Сценарий: {"items": {"<id>": {"first": [ops], "resume": [ops]}}, "reviews": [structured, ...], "scout": "текст",
            "docs": "markdown страницы"}
-ops: ["write", path, content] | ["sleep", sec] | ["fail"] | ["blocked"]
+ops: ["write", path, content] | ["shadow", path, content] | ["sleep", sec] | ["fail"] | ["blocked"]
+shadow — запись мимо инструментов (как через Bash): файл меняется, события Write в потоке нет.
 """
 import json
 import os
@@ -24,7 +25,10 @@ memo = json.load(open(memo_path)) if os.path.exists(memo_path) else {}
 with open(os.path.join(cwd, ".fake_calls.jsonl"), "a", encoding="utf-8") as fh:
     fh.write(json.dumps({"sid": sid, "resume": bool(resume), "model": opt("--model"), "effort": opt("--effort"),
                          "tools": opt("--tools"), "prompt": prompt, "worker": os.environ.get("CPLAN_WORKER"),
-                         "leak": os.environ.get("CLAUDECODE")}, ensure_ascii=False) + "\n")
+                         "leak": os.environ.get("CLAUDECODE"), "settings": opt("--settings"),
+                         "system": opt("--system-prompt"),
+                         "env": {k: os.environ.get(k) for k in ("GITLAB_TOKEN", "DB_PASSWORD", "ANTHROPIC_API_KEY",
+                                                                "CPLAN_PLAIN")}}, ensure_ascii=False) + "\n")
 
 
 def emit(obj):
@@ -61,6 +65,11 @@ for op in ops:
         sys.exit(1)
     elif op[0] == "blocked":
         text = "STATUS: BLOCKED\nнужен другой файл"
+    elif op[0] == "shadow":
+        path = os.path.join(cwd, op[1])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(op[2])
     elif op[0] == "write":
         n += 1
         path = os.path.join(cwd, op[1])

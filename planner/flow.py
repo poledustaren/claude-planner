@@ -160,12 +160,16 @@ def _finished_report(root: str, jobs: list[dict]) -> list[str]:
         if job["status"] in workers.ACTIVE or job["kind"] != "item":
             continue
         v = workers.view(job)
+        stray = (f" За время работы изменились файлы вне плана (запись мимо Edit, например через Bash): "
+                 f"{', '.join(v['drift'][:5])} — посмотри git diff и верни лишнее либо заяви файл в пункте."
+                 if v["drift"] else "")
         if job["status"] == "DONE":
             lines.append(f"Пункт {job['item_id']}: DONE, проверки прошли ({v['sec']}s, ${v['cost']})."
-                         + (f" Правил вне пункта: {', '.join(v['out_of_scope'][:5])}." if v["out_of_scope"] else ""))
+                         + (f" Правил вне пункта: {', '.join(v['out_of_scope'][:5])}." if v["out_of_scope"] else "")
+                         + stray)
         else:
             lines.append(f"Пункт {job['item_id']}: {job['status']} — {v['reason']}\n  отчёт воркера: "
-                         + (v["report"][:500].replace("\n", "\n  ") or "нет"))
+                         + (v["report"][:500].replace("\n", "\n  ") or "нет") + stray)
     return lines
 
 
@@ -396,6 +400,10 @@ def review_prompt(plan: dict, notes: str | None, screenshots: list | None) -> st
         parts.append("ПРОШЛЫЙ РАУНД ОТКЛОНЁН, блокеры были:\n" + "\n".join(
             f"- {i.get('file', '')}:{i.get('line', '')} {i['problem']}" for i in rounds[-1]["issues"]
             if i.get("severity") == "blocker") + "\nПроверь, что они устранены, и не выдвигай заново снятые.")
+    deps = core.dep_changes(plan["root"], plan.get("base_rev") or "") if core.dep_policy() != "off" else []
+    if deps:
+        parts.append("ИЗМЕНЕНЫ МАНИФЕСТЫ ЗАВИСИМОСТЕЙ: " + ", ".join(deps[:8]) + ". По диффу проверь каждую новую "
+                     "зависимость: нужна ли она пунктам плана и названа ли в них. Лишняя или необъяснённая — blocker.")
     if notes:
         parts.append("ЗАМЕЧАНИЯ ОРКЕСТРАТОРА: " + notes.strip())
     if screenshots:
@@ -458,6 +466,12 @@ def review(project_dir: str, wait: bool = True, timeout: int = 900, notes: str |
         if broken:
             raise core.PlanError("Перед приёмкой проверки прогнаны заново — есть регрессия, пункты вернулись в failed:\n"
                                  + "\n".join(core.fail_report(it, ev, 600) for it, ev in broken))
+        plan = core.load(root)
+        why = core.baseline_gate(root, plan, by="review")
+        if why:
+            raise core.PlanError("Приёмку не запускаю: " + why + ". Почини пунктом плана (plan_update(add=[...])) и "
+                                 "повтори plan_review. Красно не из-за этого плана — решает пользователь: "
+                                 "plan_finish(summary, user_approval=<цитата>, waive=[\"baseline\", \"review\"]).")
         plan = core.load(root)
         job = workers.spawn(root, "review", "review", "review", review_prompt(plan, notes, screenshots),
                             workers.SYS_REVIEW, schema=workers.REVIEW_SCHEMA)
@@ -616,7 +630,8 @@ def snapshot(project_dir: str) -> dict | None:
             "next": next_hint(root, plan)}
 
 
-def finish(project_dir: str, summary: str, user_approval: str | None = None, force: bool = False) -> str:
+def finish(project_dir: str, summary: str, user_approval: str | None = None, force: bool = False,
+           waive=None) -> str:
     root = core.project_root(project_dir)
     live = workers.active_jobs(root)
     if force:
@@ -625,7 +640,7 @@ def finish(project_dir: str, summary: str, user_approval: str | None = None, for
             workers.kill(root, job, "план закрыт как есть")
     elif live:
         raise core.PlanError(f"Ещё работают воркеры ({len(live)}). Дождись plan_jobs(wait=true, mode=\"all\") или останови.")
-    plan = core.finish(root, summary, user_approval, force)
+    plan = core.finish(root, summary, user_approval, force, waive)
     for job in workers.list_jobs(root):
         workers.cleanup_session(job)
     cost = sum(workers.view(j)["cost"] for j in workers.list_jobs(root))
@@ -634,6 +649,11 @@ def finish(project_dir: str, summary: str, user_approval: str | None = None, for
             "Проверок в плане нет: пункты закрыты записью.")
            + (" Гейты сняты решением пользователя: " + "; ".join(plan["user_override"]["gates"]) + "."
               if plan.get("user_override") else ""))
+    base = plan.get("baseline") or {}
     lines = [f"План «{plan['title']}» закрыт: {core.counts(plan)}. {how} Воркеры за план: ${round(cost, 3)}.",
+             (f"Базовые проверки проекта: {'прошли' if base.get('passed') else 'НЕ ПРОШЛИ'} ({base.get('log')})."
+              if base and not force else ""),
+             ("Манифесты зависимостей менялись: " + ", ".join(plan["deps_changed"][:8]) + " — посмотри их перед коммитом."
+              if plan.get("deps_changed") else ""),
              plane.sync(root)]
     return "\n".join(x for x in lines if x)

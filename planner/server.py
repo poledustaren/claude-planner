@@ -129,11 +129,14 @@ TOOLS = [
           "mode": {"type": "string", "enum": ["upsert", "append"], "default": "upsert"},
           "parent_title": {"type": "string", "description": "Раздел проекта, под который положить страницу"}},
          ["project_dir", "title"]),
-    tool("plan_finish", "Закрыть план: финальный прогон проверок, задача Plane → «В проверке». Требует приёмки и "
-         "свежей вики. С user_approval (цитата пользователя) — без них; с force=true — как есть: открытые "
-         "пункты → skipped, проверки не гоняются.",
+    tool("plan_finish", "Закрыть план: финальный прогон проверок пунктов и базовых проверок проекта (cplan.json), "
+         "задача Plane → «В проверке». Требует приёмки и свежей вики. С user_approval (цитата пользователя) — без них; "
+         "красные базовые проверки и изменённые манифесты зависимостей снимаются только поимённо: waive плюс "
+         "user_approval. С force=true — как есть: открытые пункты → skipped, проверки не гоняются.",
          {"project_dir": DIRP, "summary": {"type": "string", "description": "Что сделано и чем подтверждено"},
-          "user_approval": {"type": "string"}, "force": {"type": "boolean"}},
+          "user_approval": {"type": "string"}, "force": {"type": "boolean"},
+          "waive": {"type": "array", "items": {"type": "string", "enum": ["review", "docs", "baseline", "deps"]},
+                    "description": "Какие гейты пользователь разрешил снять; согласие относится только к ним"}},
          ["project_dir", "summary"]),
 ]
 
@@ -187,7 +190,7 @@ def dispatch(name: str, a: dict, progress) -> str:
         return flow.wiki_publish(d, a.get("title"), a.get("markdown"), a.get("mode", "upsert"), a.get("parent_title"),
                                  a.get("notes"), int(a.get("timeout", 600)), progress)
     if name == "plan_finish":
-        return flow.finish(d, a.get("summary"), a.get("user_approval"), bool(a.get("force")))
+        return flow.finish(d, a.get("summary"), a.get("user_approval"), bool(a.get("force")), a.get("waive"))
     raise core.PlanError(f"Инструмента {name!r} нет.")
 
 
