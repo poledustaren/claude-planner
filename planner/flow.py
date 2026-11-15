@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import time
 
-from . import core, outline, plane, workers
+from . import core, outline, plane, stages, workers
 
 REPORT_CAP = 3500
 WIKI_TEXT_CAP = 6000
@@ -22,6 +22,13 @@ def next_hint(root: str, plan: dict) -> str:
     if plan["status"] == "finished":
         return "План закрыт."
     if plan["status"] == "ready":
+        try:
+            gaps = stages.pending(plan)
+        except core.PlanError as exc:
+            gaps = [str(exc)]
+        if gaps:  # пункты закрыты, но закрытие упрётся в этапы: говорим об этом до plan_finish
+            return ("Дальше — этапы: " + "; ".join(gaps) + ". Пользователь решил закрыть так — "
+                    "plan_finish(summary, user_approval=<цитата>, waive=[\"stages\"]).")
         return "Дальше: plan_finish(summary)."
     if plan["status"] == "docs_pending":
         return ("Дальше: документация. wiki_publish(project_dir, title, notes=\"решения и грабли из разговора, "
@@ -45,7 +52,17 @@ def next_hint(root: str, plan: dict) -> str:
     easy = [i["id"] for i in plan["items"] if i.get("light") and i["status"] in ("todo", "in_progress")]
     ready = [i for i in ready if i not in easy]
     mains = [i for i in mains if i not in easy]
-    parts = []
+    parts, held = [], {}
+    for iid in list(ready):  # зависимости закрыты, но пункт держит порядок этапов или гейт
+        try:
+            why = stages.start_block(plan, core.find(plan, iid))
+        except core.PlanError as exc:
+            why = str(exc)
+        if why:
+            held.setdefault(why, []).append(iid)
+            ready.remove(iid)
+    for why, ids in held.items():
+        parts.append(f"пункты {', '.join(ids)} не стартуют: {why}")
     if easy:
         parts.append(f"пункты без проверки {', '.join(easy)}: сделай и закрой plan_verify(item_ids=[...], "
                      "note=\"что сделал и чем убедился\")")
@@ -101,10 +118,11 @@ def _prune(root: str) -> None:
 
 
 def update(project_dir: str, add=None, changes=None, hold=None, title=None, goal=None, remove=None,
-           user_approval=None, branch=None) -> str:
+           user_approval=None, branch=None, stage_pass=None, stage_skip=None, accept_config=False) -> str:
     root = core.project_root(project_dir)
     plan = core.update(root, add=add, changes=changes, hold=hold, title=title, goal=goal, remove=remove,
-                       user_approval=user_approval, branch=branch)
+                       user_approval=user_approval, branch=branch, stage_pass=stage_pass, stage_skip=stage_skip,
+                       accept_config=bool(accept_config))
     notes = [f"Замечание: {n}" for n in core.advice(plan)] if add or changes or remove else []
     return _tail(root, "\n".join(["План обновлён.", *notes, plane.sync(root)]).strip())
 
@@ -148,10 +166,16 @@ def _start_item(root: str, plan: dict, item: dict, fresh: bool, carry: str = "")
     job = workers.spawn(
         root, "item", item["tier"], f"i{item['id']}",
         workers.fix_prompt(item, last_ev) if resume else workers.item_prompt(plan, item) + carry, workers.SYS_CODE,
-        item_id=item["id"],
+        item_id=item["id"], **_fix_rounds(root, item),
         resume_session=prev[-1]["session_id"] if resume else None,
         on_created=lambda j: core.set_status(root, item["id"], "in_progress", job=j["id"]))
     return f"{item['id']}: {item['tier']} ({job['model']}) → {job['id']}" + (" (доработка в той же сессии)" if resume else "")
+
+
+def _fix_rounds(root: str, item: dict) -> dict:
+    """Этап может задать своё число кругов починки (у поставки — ноль: упавшее агент сам не чинит)."""
+    rounds = stages.max_fix(root, item)
+    return {} if rounds is None else {"max_fix": rounds}
 
 
 def _finished_report(root: str, jobs: list[dict]) -> list[str]:
@@ -177,7 +201,8 @@ def _escalate(root: str, finished: list[dict]) -> list[str]:
     """Пункт на младшей модели не прошёл проверки — без участия оркестратора перезапускается ярусом выше."""
     lines = []
     for job in finished:
-        if job["kind"] != "item" or job["status"] != "FAILED" or "BLOCKED" in str(job.get("reason", "")):
+        if job["kind"] != "item" or job["status"] != "FAILED" or "BLOCKED" in str(job.get("reason", "")) \
+                or job.get("limit"):  # упёрся в лимит — ярус выше потратит ещё больше, пункт надо делить
             continue
         was = job["tier"]
         up = core.escalate(root, str(job["item_id"]))
@@ -315,13 +340,40 @@ def worker_ctl(project_dir: str, action: str, ref, hint: str | None = None, full
     prompt = (f"Корректировка от оркестратора: {hint.strip()}\nПродолжи пункт с её учётом и заверши отчётом "
               "в том же формате.") if resume else workers.item_prompt(plan, item)
     new = workers.spawn(root, "item", item["tier"], f"i{item['id']}", prompt, workers.SYS_CODE, item_id=item["id"],
-                        resume_session=job["session_id"] if resume else None,
+                        **_fix_rounds(root, item), resume_session=job["session_id"] if resume else None,
                         on_created=lambda j: core.set_status(root, item["id"], "in_progress", job=j["id"]))
     return _tail(root, f"Пункт {item['id']}: {'корректировка в той же сессии' if resume else 'перезапуск с нуля'} → {new['id']}.")
 
 
-def scout(project_dir: str, questions, wait: bool = True, timeout: int = 300, progress=None) -> str:
+def _profile(name: str | None) -> tuple[str, str, list[str]]:
+    """Профиль разведки: (тир, системная подсказка, MCP-серверы). Без имени — обычный разведчик кода.
+
+    Профили задаёт пользователь в config.json → profiles: {"incident": {"tier": "scout", "mcp": ["grafana"]}}.
+    incident есть и без настройки: расследование только на чтение, без MCP."""
+    if not name:
+        return "scout", workers.SYS_SCOUT, []
+    conf = core.config().get("profiles")
+    conf = conf.get(name) if isinstance(conf, dict) else None
+    if not isinstance(conf, dict):
+        if name != "incident":
+            raise core.PlanError(f"Профиля {name!r} нет: встроен только incident, остальные задаёт пользователь в "
+                                 "config.json → profiles.")
+        conf = {}
+    tier = conf.get("tier") or "scout"
+    if workers.tiers().get(tier, {}).get("mode") != "read":
+        raise core.PlanError(f"Профиль {name}: tier {tier!r} должен быть тиром только на чтение (scout, review, docs).")
+    mcp = [m for m in conf.get("mcp") or [] if isinstance(m, str)]
+    lost = [m for m in mcp if m not in stages.mcp_servers()]
+    if lost:
+        raise core.PlanError(f"Профилю {name} нужен MCP-сервер {', '.join(lost)}, а в config.json → mcp_servers его "
+                             "нет: скажи пользователю.")
+    return tier, workers.SYS_INCIDENT if name == "incident" else workers.SYS_SCOUT, mcp
+
+
+def scout(project_dir: str, questions, wait: bool = True, timeout: int = 300, progress=None,
+          profile: str | None = None) -> str:
     root = core.project_root(project_dir)
+    tier, system, mcp = _profile(profile)
     if isinstance(questions, str):
         questions = [questions]
     if not isinstance(questions, list) or not 1 <= len(questions) <= workers.MAX_PARALLEL \
@@ -329,7 +381,7 @@ def scout(project_dir: str, questions, wait: bool = True, timeout: int = 300, pr
         raise core.PlanError(f"questions: от 1 до {workers.MAX_PARALLEL} конкретных вопросов (каждый ≥ 10 символов), "
                              "по одному на подсистему.")
     core._ensure_dir(root)
-    started = [workers.spawn(root, "scout", "scout", f"scout{n}", q.strip(), workers.SYS_SCOUT)
+    started = [workers.spawn(root, "scout", tier, f"{profile or 'scout'}{n}", q.strip(), system, mcp=mcp)
                for n, q in enumerate(questions, 1)]
     if not wait:
         return "Разведчики запущены: " + ", ".join(j["id"] for j in started) + ". Отчёты: plan_jobs(wait=true, mode=\"all\")."
@@ -384,10 +436,18 @@ def git_summary(root: str, base_rev: str, cap: int = DIFF_CAP) -> str:
     return "\n\n".join(parts)
 
 
-def review_prompt(plan: dict, notes: str | None, screenshots: list | None) -> str:
-    rounds = core.review_rounds(plan)
-    parts = [f"ЦЕЛЬ ПЛАНА: {plan['goal']}", "ПУНКТЫ:"]
+def review_prompt(plan: dict, notes: str | None, screenshots: list | None, stage: str | None = None,
+                  only: set | None = None) -> str:
+    rounds = core.review_rounds(plan) if stage is None else \
+        ((plan.get("stage_reviews") or {}).get(stage) or {}).get("rounds") or []
+    parts = [f"ЦЕЛЬ ПЛАНА: {plan['goal']}"]
+    if stage is not None:
+        parts.append(f"ПРИЁМКА ЭТАПА {stage}: проверяй только его пункты. Остальные пункты плана ещё не начаты "
+                     "или приняты раньше — их незавершённость не дефект.")
+    parts.append("ПУНКТЫ:")
     for it in plan["items"]:
+        if only is not None and it["id"] not in only:
+            continue
         ev = it["evidence"][-1] if it["evidence"] else None
         stamp = it.get("manual") or (it.get("skip") if it["status"] == "skipped" else None)
         parts.append(f"- {it['id']} [{it['status']}] {it['title']}\n  приёмка: {it['acceptance']}\n  файлы: "
@@ -415,11 +475,12 @@ def review_prompt(plan: dict, notes: str | None, screenshots: list | None) -> st
     return "\n\n".join(parts)
 
 
-def _collect_review(root: str, job: dict) -> str:
+def _collect_review(root: str, job: dict, stage: str | None = None) -> str:
     v = workers.view(job)
     data = v["structured"] if isinstance(v["structured"], dict) else None
     with core.mutate(root) as plan:
-        rev = plan.setdefault("review", {})
+        rev = plan.setdefault("review", {}) if stage is None else \
+            plan.setdefault("stage_reviews", {}).setdefault(stage, {})
         rev.pop("job", None)
         if job["status"] != "DONE" or data is None:
             core.event(plan, "review_error", note=v["reason"] or "нет структурного вердикта")
@@ -432,20 +493,67 @@ def _collect_review(root: str, job: dict) -> str:
         rounds.append({"n": len(rounds) + 1, "ts": core.now(), "job": job["id"], "verdict": verdict, "issues": issues})
         if verdict == "approved":
             rev["approved_at"] = core.now()
-        core.event(plan, "review_" + verdict)
+            if stage is not None:
+                plan.setdefault("stage_pass", {})[stage] = {"by": "review", "job": job["id"], "ts": core.now()}
+        core.event(plan, ("review_" if stage is None else "stage_review_") + verdict, note=stage or "")
     workers.cleanup_session(job)
 
     def fmt(i):
         where = f"{i.get('file', '')}:{i.get('line', '')}".strip(":")
         return (f"- [{i.get('severity')}] " + (f"п.{i['item_id']} " if i.get("item_id") else "")
                 + (f"{where} — " if where else "") + i["problem"] + (f" → {i['fix']}" if i.get("fix") else ""))
-    head = f"Приёмка, раунд {len(rounds)}: {verdict.upper()} ({v['model']}, {v['sec']}s, ${v['cost']})."
+    head = (f"Приёмка{'' if stage is None else ' этапа ' + stage}, раунд {len(rounds)}: {verdict.upper()} "
+            f"({v['model']}, {v['sec']}s, ${v['cost']}).")
     return "\n".join([head, *[fmt(i) for i in blockers], *[fmt(i) for i in issues if i not in blockers][:8]])
 
 
+def _stage_review(root: str, stage: str, wait: bool, timeout: int, notes, screenshots, progress) -> str:
+    """Приёмка одного этапа: гейт review перед следующим этапом, когда остальной план ещё не закрыт."""
+    plan = core.load(root)
+    stage_list = stages.load(root)
+    st = stages.get(stage_list, str(stage).strip())
+    if not st:
+        raise core.PlanError(f"Этапа {stage!r} нет. Есть: {', '.join(s['name'] for s in stage_list) or '—'}.")
+    if st["gate"] != "review":
+        raise core.PlanError(f"У этапа {st['name']} гейт {st['gate']}: приёмка этапа нужна только при gate=review.")
+    pending = ((plan.get("stage_reviews") or {}).get(st["name"]) or {}).get("job")
+    job = workers.read_job(root, pending) if pending else None
+    if job is None:
+        own = stages.items_of(plan, stage_list, st["name"])
+        opened = [i["id"] for i in own if i["status"] not in core.CLOSED]
+        if not own or opened:
+            raise core.PlanError(f"Приёмка этапа {st['name']} возможна, когда его пункты закрыты. Открыты: "
+                                 f"{', '.join(opened) or 'пунктов этапа нет'}.")
+        if stages.passed(plan, stage_list, st):
+            raise core.PlanError(f"Гейт этапа {st['name']} уже пройден, после него пункты этапа не менялись.")
+        ids = {i["id"] for i in own}
+        done_ids = [i for i in core.recheckable(plan) if i in ids]
+        broken = [(it, ev) for it, ev in core.verify_items(root, done_ids, by="review", recheck=True)
+                  if not ev["passed"]] if done_ids else []
+        if broken:
+            raise core.PlanError("Перед приёмкой этапа проверки прогнаны заново — есть регрессия, пункты вернулись "
+                                 "в failed:\n" + "\n".join(core.fail_report(it, ev, 600) for it, ev in broken))
+        plan = core.load(root)
+        job = workers.spawn(root, "review", "review", f"review-{st['name']}",
+                            review_prompt(plan, notes, screenshots, stage=st["name"], only=ids),
+                            workers.SYS_REVIEW, schema=workers.REVIEW_SCHEMA)
+        with core.mutate(root) as plan:
+            plan.setdefault("stage_reviews", {}).setdefault(st["name"], {})["job"] = job["id"]
+            core.event(plan, "stage_review_start", note=st["name"])
+    if job["status"] in workers.ACTIVE:
+        if not wait:
+            return f"Приёмщик этапа работает: {job['id']}. Результат: plan_review(stage=\"{st['name']}\")."
+        (job,) = workers.wait(root, [job["id"]], "all", timeout, progress) or (job,)
+        if job["status"] in workers.ACTIVE:
+            return f"Приёмщик этапа ещё работает ({job['id']}). Повтори plan_review(stage=\"{st['name']}\") позже."
+    return _tail(root, _collect_review(root, job, st["name"]))
+
+
 def review(project_dir: str, wait: bool = True, timeout: int = 900, notes: str | None = None,
-           screenshots: list | None = None, progress=None) -> str:
+           screenshots: list | None = None, progress=None, stage: str | None = None) -> str:
     root = core.project_root(project_dir)
+    if stage:
+        return _stage_review(root, stage, wait, timeout, notes, screenshots, progress)
     plan = core.load(root)
     pending = (plan.get("review") or {}).get("job")
     job = workers.read_job(root, pending) if pending else None
@@ -518,7 +626,7 @@ def wiki_pages(project_dir: str, include_text: bool = False) -> str:
     return "\n".join(lines)
 
 
-def docs_prompt(root: str, plan: dict, title: str, notes, current: str) -> str:
+def docs_prompt(root: str, plan: dict, title: str, notes, current: str, template: str = "") -> str:
     parts = [f"СТРАНИЦА: {title}", f"ПЛАН: {plan['title']}\nЦЕЛЬ: {plan['goal']}", "ПУНКТЫ:"]
     for it in plan["items"]:
         ev = it["evidence"][-1] if it["evidence"] else None
@@ -538,10 +646,13 @@ def docs_prompt(root: str, plan: dict, title: str, notes, current: str) -> str:
     parts.append(git_summary(root, plan.get("base_rev") or "", cap=20000) or "Диффа нет (проект вне git): читай файлы пунктов.")
     if current.strip():
         parts.append("ТЕКУЩИЙ ТЕКСТ СТРАНИЦЫ (обнови его, а не пиши заново):\n" + current[:WIKI_TEXT_CAP])
+    if template:
+        parts.append("ШАБЛОН СТРАНИЦЫ (пиши строго по нему):\n" + template[:stages.TEMPLATE_CAP])
     return "\n\n".join(parts)
 
 
-def _write_docs(root: str, plan: dict, title: str, notes, client, collection: str, timeout: int, progress) -> tuple[str, str]:
+def _write_docs(root: str, plan: dict, title: str, notes, client, collection: str, timeout: int, progress,
+                template: str = "") -> tuple[str, str]:
     """Страницу пишет дешёвый воркер по материалам плана; оркестратор получает ссылку и оглавление."""
     current = ""
     try:
@@ -549,7 +660,8 @@ def _write_docs(root: str, plan: dict, title: str, notes, client, collection: st
         current = next((p.get("text") or "" for p in found["pages"] if p.get("title") == title), "")
     except outline.OutlineError:
         pass
-    job = workers.spawn(root, "docs", "docs", "docs", docs_prompt(root, plan, title, notes, current), workers.SYS_DOCS)
+    system = workers.SYS_DOCS.replace("{structure}", workers.DOCS_BY_TEMPLATE if template else workers.DOCS_FREE)
+    job = workers.spawn(root, "docs", "docs", "docs", docs_prompt(root, plan, title, notes, current, template), system)
     (job,) = workers.wait(root, [job["id"]], "all", timeout, progress) or (job,)
     v = workers.view(job)
     text = re.sub(r"^```(?:markdown|md)?\s*\n|\n```\s*$", "", v["report"].strip())
@@ -564,8 +676,13 @@ def _write_docs(root: str, plan: dict, title: str, notes, client, collection: st
 
 
 def wiki_publish(project_dir: str, title: str, markdown: str | None = None, mode: str = "upsert",
-                 parent_title: str | None = None, notes=None, timeout: int = 600, progress=None) -> str:
+                 parent_title: str | None = None, notes=None, timeout: int = 600, progress=None,
+                 template: str | None = None) -> str:
     root = core.project_root(project_dir)
+    pattern = stages.template_text(root, template) if template else ""
+    if template and pattern is None:
+        raise core.PlanError(f"Шаблона {template!r} нет. Есть: {', '.join(stages.template_names(root))}; свой "
+                             "кладётся в docs/_tpl/<имя>.md.")
     if not isinstance(title, str) or len(title.strip()) < 3:
         raise core.PlanError("title обязателен: заголовок страницы.")
     auto = not (isinstance(markdown, str) and markdown.strip())
@@ -584,7 +701,15 @@ def wiki_publish(project_dir: str, title: str, markdown: str | None = None, mode
         if plan is None:
             raise core.PlanError("Без markdown страницу пишет воркер по материалам плана, а плана в проекте нет: "
                                  "передай markdown.")
-        markdown, wrote = _write_docs(root, plan, title.strip(), notes, client, collection, timeout, progress)
+        markdown, wrote = _write_docs(root, plan, title.strip(), notes, client, collection, timeout, progress,
+                                      pattern or "")
+    if pattern:  # страница по шаблону: проверяем правила автора, в вики уходит текст без шапки и служебного комментария
+        from . import doclint
+        flaws = doclint.lint(markdown)
+        wrote = (wrote + "\n" if wrote else "") + (
+            "Проверка страницы по шаблону: замечаний нет." if not flaws else
+            "Проверка страницы по шаблону — замечания (поправь и опубликуй заново):\n" + "\n".join(f"- {f}" for f in flaws))
+        markdown = doclint.publishable(markdown)
     meta = plane.enrich_meta(root, plan)
     passport = (f"# {outline.root_title(os.path.basename(root))}\n\n- Назначение: {meta.get('features')}\n"
                 f"- Стек: {meta.get('stack')}\n- Путь: `{root}`\n- Деплой и проверка: {meta.get('deploy_rules')}\n")

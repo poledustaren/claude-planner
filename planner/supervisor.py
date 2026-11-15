@@ -41,6 +41,8 @@ def run_claude(job: dict, prompt: str, resume: bool) -> str | None:
             proc.communicate()
             return f"таймаут {job['timeout']}s"
     tel = workers.telemetry(job["root"], job["id"])
+    if tel["stop"] in workers.LIMIT_STOPS:
+        return workers.limit_reason(job, tel["stop"])
     if proc.returncode != 0 or not tel["finished"] or tel["is_error"]:
         tail = ""
         try:
@@ -74,7 +76,8 @@ def supervise(job: dict) -> None:
                 seen = []
             job = _update(job, drift=sorted({*(job.get("drift") or []), *seen}))
         if failure:
-            _update(job, status="FAILED", reason=failure, ended=time.time())
+            hit = tel["stop"] if tel["stop"] in workers.LIMIT_STOPS else None
+            _update(job, status="FAILED", reason=failure, ended=time.time(), **({"limit": hit} if hit else {}))
             if item_id:
                 core.set_status(root, item_id, "failed", f"воркер: {failure}", job=job["id"])
             return

@@ -3,7 +3,8 @@
 
 Сценарий: {"items": {"<id>": {"first": [ops], "resume": [ops]}}, "reviews": [structured, ...], "scout": "текст",
            "docs": "markdown страницы"}
-ops: ["write", path, content] | ["shadow", path, content] | ["sleep", sec] | ["fail"] | ["blocked"]
+ops: ["write", path, content] | ["shadow", path, content] | ["sleep", sec] | ["fail"] | ["blocked"] |
+     ["limit", "turns" | "usd"] — сессия упёрлась в --max-turns или --max-budget-usd
 shadow — запись мимо инструментов (как через Bash): файл меняется, события Write в потоке нет.
 """
 import json
@@ -26,7 +27,7 @@ with open(os.path.join(cwd, ".fake_calls.jsonl"), "a", encoding="utf-8") as fh:
     fh.write(json.dumps({"sid": sid, "resume": bool(resume), "model": opt("--model"), "effort": opt("--effort"),
                          "tools": opt("--tools"), "prompt": prompt, "worker": os.environ.get("CPLAN_WORKER"),
                          "leak": os.environ.get("CLAUDECODE"), "settings": opt("--settings"),
-                         "system": opt("--system-prompt"),
+                         "system": opt("--system-prompt"), "argv": args,
                          "env": {k: os.environ.get(k) for k in ("GITLAB_TOKEN", "DB_PASSWORD", "ANTHROPIC_API_KEY",
                                                                 "CPLAN_PLAIN")}}, ensure_ascii=False) + "\n")
 
@@ -45,6 +46,8 @@ if opt("--json-schema"):
     text = json.dumps(structured)
 elif "разведчик" in (opt("--system-prompt") or ""):
     text = scenario.get("scout", "ГДЕ: a.py:1")
+elif "расследуешь инцидент" in (opt("--system-prompt") or ""):
+    text = scenario.get("incident", "ХРОНОЛОГИЯ: 03:10 вход с нового адреса")
 elif "технический писатель" in (opt("--system-prompt") or ""):
     text = scenario.get("docs", "# Страница\n\n## Цель\nФункция a возвращает 42 (a.py:1).\n\n## Что сделано\n"
                         "Исправлена a.py, добавлен out.txt.\n\n## Как запускать и проверять\n`test -f out.txt`\n\n"
@@ -62,6 +65,10 @@ for op in ops:
         time.sleep(op[1])
     elif op[0] == "fail":
         emit({"type": "result", "subtype": "error_during_execution", "is_error": True, "session_id": sid})
+        sys.exit(1)
+    elif op[0] == "limit":
+        emit({"type": "result", "subtype": "error_max_turns" if op[1] == "turns" else "error_max_budget_usd",
+              "is_error": True, "num_turns": 3, "total_cost_usd": 0.5, "session_id": sid})
         sys.exit(1)
     elif op[0] == "blocked":
         text = "STATUS: BLOCKED\nнужен другой файл"

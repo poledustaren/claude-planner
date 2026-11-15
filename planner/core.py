@@ -59,7 +59,7 @@ _PIPE_SH = re.compile(r"(?:curl|wget)\b[^|;&\n]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\
 _ENV_PREFIX = re.compile(r"^(?:(?:\w+=\S*|then|do|else|exec|env|nohup|time|xargs|command|builtin)\s+)+")
 CONFIG_FILE = "~/.config/claude-planner/config.json"
 PROJECT_FILE = "cplan.json"   # в корне проекта: базовые проверки, которые задаёт пользователь, а не модель
-WAIVABLE = ("review", "docs", "baseline", "deps")
+WAIVABLE = ("review", "docs", "baseline", "deps", "stages")
 # Манифесты, где любое изменение — про зависимости, и манифесты, где зависимость узнаётся по добавленной строке.
 DEP_FILES = ("requirements*.txt", "constraints*.txt", "pyproject.toml", "setup.py", "setup.cfg", "Pipfile", "Pipfile.lock",
              "poetry.lock", "uv.lock", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
@@ -386,7 +386,14 @@ def normalize_check(c, where: str, trusted: bool = False) -> dict:
             raise PlanError(f"{where}: у http-проверки нужен url с http:// или https://.")
         return {"type": "http", "url": url,
                 "expect_status": _int(c.get("expect_status"), 200, where, "expect_status", 100, 599), **extra}
-    raise PlanError(f"{where}: неизвестный type {kind!r}. Допустимо: cmd, node, file_exists, file_contains, http.")
+    if kind == "doc":
+        path, words = c.get("path"), c.get("max_words")
+        if not isinstance(path, str) or not path.strip():
+            raise PlanError(f"{where}: у doc-проверки нужен path — страница документации в проекте.")
+        if words is not None:
+            words = _int(words, 25, where, "max_words", 5, 60)
+        return {"type": "doc", "path": path.strip(), **({"max_words": words} if words else {})}
+    raise PlanError(f"{where}: неизвестный type {kind!r}. Допустимо: cmd, node, file_exists, file_contains, http, doc.")
 
 
 def normalize_tier(value, where: str) -> str:
@@ -478,9 +485,16 @@ def build_item(raw, item_id: str, root: str) -> dict:
     context = raw.get("context", raw.get("description")) or ""
     if not isinstance(context, str):
         raise PlanError(f"{where}: context — строка (ориентиры file:L1-L2, символы, ограничения).")
+    stage = raw.get("stage")
+    if stage is not None and (not isinstance(stage, str) or not stage.strip()):
+        raise PlanError(f"{where}: stage — имя этапа из {PROJECT_FILE} (нужно только пункту без файлов).")
+    stage = stage.strip() if stage else None
+    from . import stages  # этап определяют пути пункта; явное поле — только для пунктов без файлов
+    stages.check_item(root, {"id": item_id, "tier": tier, "files": files, "stage": stage}, where)
     return {"id": item_id, "title": title.strip(), "acceptance": acceptance.strip(), "verify": checks,
             "tier": tier, "files": files, "depends_on": [str(d).strip() for d in deps],
-            "context": context.strip(), "status": "todo", "evidence": [], **({"light": light} if light else {})}
+            "context": context.strip(), "status": "todo", "evidence": [], **({"light": light} if light else {}),
+            **({"stage": stage} if stage and not files else {})}
 
 
 def compute_waves(items: list) -> dict[str, int]:
@@ -614,6 +628,10 @@ def init(root: str, title: str, goal: str, items, review="auto", track="auto", r
                 "branch": git_branch(root), "baseline_sha": conf_digest(root), "dep_dirty": dep_dirty(root, head),
                 "review_mode": review, "track": track, "docs": {"mode": docs, "published": []},
                 "items": [], "history": []}
+        from . import stages
+        plan["staged"] = bool(stages.load(root))
+        if plan["staged"]:
+            plan["stage_dirty"] = stages.snapshot(root, head)
         _append_items(plan, items, root)
         event(plan, "init")
         save(root, plan)
@@ -628,10 +646,11 @@ def approval_quote(user_approval, what: str) -> str:
 
 
 def update(root: str, add=None, changes=None, hold=None, title=None, goal=None, remove=None,
-           user_approval=None, branch=None) -> dict:
-    if not add and not changes and not remove and hold is None and title is None and goal is None and branch is None:
+           user_approval=None, branch=None, stage_pass=None, stage_skip=None, accept_config=False) -> dict:
+    if not add and not changes and not remove and hold is None and title is None and goal is None and branch is None \
+            and not stage_pass and not stage_skip and not accept_config:
         raise PlanError("Нечего менять: передай add (новые пункты), update (правки пунктов), remove (удалить "
-                        "пункты), title, goal или hold.")
+                        "пункты), title, goal, hold, stage_pass, stage_skip или accept_config.")
     if title is not None and (not isinstance(title, str) or len(title.strip()) < 3):
         raise PlanError("title: новое название плана (≥ 3 символов).")
     if goal is not None and (not isinstance(goal, str) or len(goal.strip()) < 10):
@@ -639,6 +658,10 @@ def update(root: str, add=None, changes=None, hold=None, title=None, goal=None, 
     if isinstance(remove, (str, int)):
         remove = [remove]
     approval = approval_quote(user_approval, "Удалить пункты из плана") if remove else ""
+    if accept_config:
+        approval = approval_quote(user_approval, f"Принять изменённый {PROJECT_FILE}")
+    if stage_pass or stage_skip:
+        approval = approval_quote(user_approval, "Пройти гейт этапа или отказаться от этапа")
     with locked(root):
         plan = load(root)
         if plan.get("status") == "finished":
@@ -646,6 +669,36 @@ def update(root: str, add=None, changes=None, hold=None, title=None, goal=None, 
             plan.pop("finished_at", None)
             plan.pop("closed_as_is", None)
             event(plan, "reopen")
+        if accept_config or stage_pass or stage_skip:
+            from . import stages
+            if accept_config:  # пользователь видел новый файл: дальше план живёт по нему
+                stage_list = stages.load(root)
+                for it in plan["items"]:
+                    stages.of_item(stage_list, it)  # новая раскладка путей не должна разорвать пункт между этапами
+                plan["baseline_sha"], plan["staged"] = conf_digest(root), bool(stage_list) or bool(plan.get("staged"))
+                event(plan, "config_accept", note=approval)
+            stage_list = stages.load(root)
+            for name, book in ((stage_pass, "stage_pass"), (stage_skip, "stage_skip")):
+                if not name:
+                    continue
+                st = stages.get(stage_list, str(name).strip())
+                if not st:
+                    raise PlanError(f"{book}: этапа {name!r} нет. Есть: {', '.join(s['name'] for s in stage_list) or '—'}.")
+                own = stages.items_of(plan, stage_list, st["name"])
+                if book == "stage_pass":
+                    if st["gate"] != "user":
+                        raise PlanError(f"stage_pass: у этапа {st['name']} гейт {st['gate']}, согласием он не проходится"
+                                        + (f" — нужна приёмка plan_review(stage=\"{st['name']}\")." if st["gate"] == "review"
+                                           else "."))
+                    opened = [i["id"] for i in own if i["status"] not in CLOSED]
+                    if not own or opened:
+                        raise PlanError(f"stage_pass: гейт проходится, когда пункты этапа {st['name']} закрыты. "
+                                        f"Открыты: {', '.join(opened) or 'пунктов этапа нет'}.")
+                elif not st["required_for"] or own:
+                    raise PlanError(f"stage_skip: отказаться можно от обязательного этапа (required_for), у которого "
+                                    f"нет пунктов; {st['name']} — не такой.")
+                plan.setdefault(book, {})[st["name"]] = {"by": "user", "user_approval": approval, "ts": now()}
+                event(plan, book, note=f"{st['name']} | согласие: {approval}")
         if branch is not None:
             cur = git_branch(root)
             if not cur or str(branch).strip() != cur:
@@ -676,7 +729,8 @@ def update(root: str, add=None, changes=None, hold=None, title=None, goal=None, 
             if it["status"] == "in_progress" and it.get("job"):
                 raise PlanError(f"Пункт {it['id']} сейчас у воркера. Останови: plan_worker(action=kill|steer).")
             merged = {**{k: it[k] for k in ("title", "acceptance", "verify", "tier", "files", "depends_on", "context")},
-                      "light": it.get("light"), **{k: v for k, v in ch.items() if k not in ("id", "reopen")}}
+                      "light": it.get("light"), "stage": it.get("stage"),
+                      **{k: v for k, v in ch.items() if k not in ("id", "reopen")}}
             if ch.get("verify") and "light" not in ch:
                 merged["light"] = None  # пункту дали проверку — он больше не light
             fresh = build_item(merged, it["id"], root)
@@ -684,6 +738,9 @@ def update(root: str, add=None, changes=None, hold=None, title=None, goal=None, 
             it.pop("light", None)
             if fresh.get("light"):
                 it["light"] = fresh["light"]
+            it.pop("stage", None)
+            if fresh.get("stage"):
+                it["stage"] = fresh["stage"]
             if ch.get("reopen"):
                 it["status"] = "todo"
                 for key in ("closed_at", "manual", "skip"):
@@ -725,7 +782,11 @@ def start_gate(plan: dict, item: dict) -> str | None:
             clash = mine & set(file_paths(other))
             if clash:
                 return f"файл {sorted(clash)[0]} сейчас правит пункт {other['id']}"
-    return None
+    from . import stages
+    try:
+        return stages.start_block(plan, item)
+    except PlanError as exc:
+        return str(exc)
 
 
 def set_status(root: str, item_id: str, status: str, note: str = "", job: str | None = None) -> None:
@@ -772,6 +833,9 @@ def escalate(root: str, item_id: str) -> str | None:
         it = find(plan, item_id)
         up = ESCALATE.get(it["tier"])
         if not up or it["status"] != "failed":
+            return None
+        from . import stages
+        if not stages.tier_allowed(root, it, up):
             return None
         it.update(escalated_from=it["tier"], tier=up)
         event(plan, "escalate", it["id"], f"{it['escalated_from']} → {up}")
@@ -844,6 +908,9 @@ def run_check(root: str, c: dict) -> tuple[bool, str, str]:
         if "contains" in c and c["contains"] not in out:
             return False, f"в выводе нет {c['contains']!r}", out
         return True, f"{c['server']}: exit {code}", out
+    if kind == "doc":
+        from . import doclint  # страница по шаблону: шапка, разделы, длина предложений, жаргон, одна схема
+        return doclint.check(root, c)
     if kind == "file_exists":
         missing = [p for p in c["paths"] if not os.path.exists(os.path.join(root, p))]
         detail = f"нет файлов: {', '.join(missing)}" if missing else "файлы на месте"
@@ -1020,15 +1087,20 @@ def run_baseline(root: str, by: str) -> dict | None:
     return ev
 
 
+def config_changed(root: str, plan: dict) -> bool:
+    """cplan.json не тот, что был при создании плана (или при последнем принятии пользователем)."""
+    return "baseline_sha" in plan and conf_digest(root) != plan["baseline_sha"]
+
+
 def baseline_gate(root: str, plan: dict, by: str) -> str | None:
     """Причина, по которой базовые проверки не дают идти дальше, или None. Чеклист из одних light их не гоняет."""
     if not heavy(plan):
         return None
-    if "baseline_sha" in plan and conf_digest(root) != plan["baseline_sha"]:
+    if config_changed(root, plan):
         # Изменённые команды не исполняем: сначала их должен увидеть пользователь.
         return (f"{PROJECT_FILE} изменён после создания плана, базовые проверки не запускались: их задаёт пользователь, "
-                "и изменённые команды он должен увидеть до запуска. Покажи ему разницу; вернуть файл к прежнему виду "
-                "может только он")
+                "и изменённые команды он должен увидеть до запуска. Покажи ему разницу. Он согласен с новым файлом — "
+                "plan_update(accept_config=true, user_approval=<цитата>); вернуть прежний вид может только он")
     ev = run_baseline(root, by)
     if ev and not ev["passed"]:
         return "базовые проверки проекта не прошли: " + fail_summary(ev) + f" (лог: {ev['log']})"
@@ -1104,7 +1176,7 @@ USER_WAY_OUT = ("Обойти можно только решением поль�
                 "с force=true — как есть: открытые пункты уйдут в skipped, проверки не гоняются.")
 LATE_WAY_OUT = ("Почини и повтори plan_finish. Принять как есть может только пользователь: спроси его (пауза "
                 "plan_update(hold=...)) и передай дословный ответ вместе с названием гейта — "
-                "plan_finish(summary, user_approval=<цитата>, waive=[\"baseline\"] или [\"deps\"]). "
+                "plan_finish(summary, user_approval=<цитата>, waive=[\"baseline\"], [\"deps\"] или [\"stages\"]). "
                 "Согласие на один гейт остальные не снимает.")
 
 
@@ -1177,6 +1249,10 @@ def finish(root: str, summary: str, user_approval: str | None = None, force: boo
     if deps and dep_policy() == "ask":
         late["deps"] = ("изменены манифесты зависимостей: " + ", ".join(deps[:8])
                         + " — новая зависимость или версия проходит только с согласия пользователя")
+    from . import stages
+    gaps = stages.pending(plan)
+    if gaps:
+        late["stages"] = "; ".join(gaps)
     stuck = [late[k] for k in late if k not in waive]
     if stuck:
         raise PlanError("Закрыть нельзя: " + "; ".join(stuck) + ". " + LATE_WAY_OUT)
@@ -1220,6 +1296,18 @@ def status_line(plan: dict) -> str:
 def render(plan: dict) -> str:
     waves = compute_waves(plan["items"]) if plan["items"] else {}
     lines = [f"# {plan['title']}", "", f"Цель: {plan['goal']}", f"Статус: {status_line(plan)}", ""]
+    from . import stages
+    try:
+        stage_list = stages.load(plan.get("root") or "")
+    except PlanError:
+        stage_list = []
+
+    def stage_of(it):
+        try:
+            name = stages.of_item(stage_list, it)
+        except PlanError:
+            name = "разные этапы"
+        return f", этап {name}" if name else ""
     for it in plan["items"]:
         deps = f" ← {','.join(it['depends_on'])}" if it["depends_on"] else ""
         tail = ""
@@ -1233,8 +1321,11 @@ def render(plan: dict) -> str:
             stamp = it.get("manual") or it["skip"]
             tail = f" — {'принят' if it.get('manual') else 'пропущен'} решением пользователя: {stamp['reason'][:120]}"
         kind = f", без проверки: {LIGHT[it['light']]}" if it.get("light") else ""
-        lines.append(f"- {BOX[it['status']]} {it['id']} ({it['tier']}{kind}, волна {waves.get(it['id'], '?')}{deps}) "
-                     f"{it['title']}{tail}")
+        lines.append(f"- {BOX[it['status']]} {it['id']} ({it['tier']}{kind}{stage_of(it)}, волна "
+                     f"{waves.get(it['id'], '?')}{deps}) {it['title']}{tail}")
+    flow_line = stages.summary(plan)
+    if flow_line:
+        lines += ["", flow_line]
     rounds = review_rounds(plan)
     if rounds:
         last = rounds[-1]

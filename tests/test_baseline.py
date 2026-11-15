@@ -147,7 +147,7 @@ class Dependencies(ProjectCase):
         with self.assertRaises(core.PlanError) as ctx:
             flow.finish(self.dir, "готово, проверки пунктов прошли")
         self.assertIn("изменены манифесты зависимостей: requirements.txt", str(ctx.exception))
-        self.assertIn('waive=["baseline"] или ["deps"]', str(ctx.exception))
+        self.assertIn('waive=["baseline"], ["deps"] или ["stages"]', str(ctx.exception))
         with self.assertRaises(core.PlanError):  # согласие «на всё» зависимость не пропускает
             flow.finish(self.dir, "готово, проверки пунктов прошли", user_approval="да, закрывай")
         out = flow.finish(self.dir, "добавили toolbelt", user_approval="да, toolbelt нужен", waive=["deps"])
@@ -211,7 +211,7 @@ class Dependencies(ProjectCase):
     def test_finish_tool_accepts_waive(self):
         from planner import server
         schema = next(t for t in server.TOOLS if t["name"] == "plan_finish")["inputSchema"]
-        self.assertEqual(schema["properties"]["waive"]["items"]["enum"], ["review", "docs", "baseline", "deps"])
+        self.assertEqual(schema["properties"]["waive"]["items"]["enum"], ["review", "docs", "baseline", "deps", "stages"])
         with self.assertRaises(core.PlanError):
             core.normalize_waive(["tests"], "да")
 

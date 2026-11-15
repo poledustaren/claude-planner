@@ -27,7 +27,8 @@ ITEM = {
         "verify": {"type": "array", "description": "Детерминированные проверки: строка-команда или объект "
                    "{type:cmd,cmd,timeout?,contains?} | {type:node,server,cmd,contains?} — на узле через devopsmcp-ro | "
                    "{type:file_contains,path,pattern} | "
-                   "{type:file_exists,paths} | {type:http,url,expect_status?,contains?}", "items": {}},
+                   "{type:file_exists,paths} | {type:http,url,expect_status?,contains?} | "
+                   "{type:doc,path} — страница", "items": {}},
         "tier": {"type": "string", "enum": list(core.TIERS),
                  "description": "main — сам; code-mini — Haiku (механика, при провале сам уходит на code-low); code-low — "
                                 "Sonnet/low; code — Sonnet/medium (по умолчанию); code-high — Sonnet/high"},
@@ -39,6 +40,7 @@ ITEM = {
                                  "доделка. Только main"},
         "context": {"type": "string", "description": "Ориентиры для воркера: path/file.py:L10-L80 (срез будет "
                     "вшит в его промпт), имена символов, ограничения"},
+        "stage": {"type": "string", "description": "Этап — только пункту без files"},
     },
 }
 
@@ -53,7 +55,8 @@ TOOLS = [
          "на вопросы по коду и возвращают file:line, устройство, что менять и чем проверять. План не нужен.",
          {"project_dir": DIRP, "questions": {"type": "array", "items": {"type": "string"},
                                              "description": "По одному конкретному вопросу на подсистему"},
-          "wait": {"type": "boolean", "default": True}, "timeout": {"type": "integer", "default": 300}},
+          "wait": {"type": "boolean", "default": True}, "timeout": {"type": "integer", "default": 300},
+          "profile": {"type": "string", "description": "incident — расследование только на чтение"}},
          ["project_dir", "questions"]),
     tool("plan_init", "Создать план: без него хук не даст править файлы проекта. Мелочь — пункты light (без Plane, "
          "вики, приёмки); иначе пункты с verify, приёмка от 4 пунктов.",
@@ -70,7 +73,8 @@ TOOLS = [
          ["project_dir", "title", "goal", "items"]),
     tool("plan_update", "Изменить план: add — новые пункты (в т.ч. доработка после приёмки); update — правка "
          "полей пункта по id (reopen:true переоткрывает закрытый); title, goal — название и цель; remove — "
-         "удалить пункты (с user_approval); hold — причина паузы (ждём пользователя), пустая строка снимает.",
+         "удалить пункты (с user_approval); hold — причина паузы (ждём пользователя), пустая строка снимает; "
+         "stage_pass, stage_skip, accept_config — гейт этапа, отказ от этапа, новый cplan.json (с user_approval).",
          {"project_dir": DIRP,
           "add": {"type": "array", "items": {"type": "object"}, "description": "Пункты, как items в plan_init"},
           "update": {"type": "array", "items": {"type": "object"},
@@ -78,7 +82,8 @@ TOOLS = [
           "hold": {"type": "string"},
           "branch": {"type": "string", "description": "Перенести план в текущую ветку git"},
           "title": {"type": "string"}, "goal": {"type": "string"},
-          "remove": IDS, "user_approval": {"type": "string", "description": "Цитата согласия пользователя (для remove)"}},
+          "stage_pass": {"type": "string"}, "stage_skip": {"type": "string"}, "accept_config": {"type": "boolean"},
+          "remove": IDS, "user_approval": {"type": "string", "description": "Цитата согласия пользователя"}},
          ["project_dir"]),
     tool("plan_run", "Двигать план: стартует все готовые пункты (воркеры Sonnet параллельно, до 4; main — помечает "
          "тебе) и при wait ждёт первого завершившегося воркера. Надзиратель сам прогоняет проверки пункта и при "
@@ -117,7 +122,8 @@ TOOLS = [
           "timeout": {"type": "integer", "default": 900},
           "notes": {"type": "string", "description": "Пояснения приёмщику, в т.ч. возражения на прошлые блокеры"},
           "screenshots": {"type": "array", "items": {"type": "string"},
-                          "description": "Пути к скриншотам для задач с интерфейсом"}}, ["project_dir"]),
+                          "description": "Пути к скриншотам для задач с интерфейсом"},
+          "stage": {"type": "string", "description": "Приёмка одного этапа"}}, ["project_dir"]),
     tool("wiki_pages", "Страницы проекта в Outline: что уже задокументировано. Нужен, только если пишешь страницу сам.",
          {"project_dir": DIRP, "include_text": {"type": "boolean", "description": "Вернуть и текст страниц"}},
          ["project_dir"]),
@@ -127,7 +133,8 @@ TOOLS = [
           "notes": {"type": "string", "description": "3–6 строк: решения и грабли из разговора, которых нет в плане"},
           "markdown": {"type": "string", "description": "Готовый текст, если пишешь сам"},
           "mode": {"type": "string", "enum": ["upsert", "append"], "default": "upsert"},
-          "parent_title": {"type": "string", "description": "Раздел проекта, под который положить страницу"}},
+          "parent_title": {"type": "string", "description": "Раздел проекта, под который положить страницу"},
+          "template": {"type": "string", "description": "howto-dev | howto-support | done"}},
          ["project_dir", "title"]),
     tool("plan_finish", "Закрыть план: финальный прогон проверок пунктов и базовых проверок проекта (cplan.json), "
          "задача Plane → «В проверке». Требует приёмки и свежей вики. С user_approval (цитата пользователя) — без них; "
@@ -135,7 +142,7 @@ TOOLS = [
          "user_approval. С force=true — как есть: открытые пункты → skipped, проверки не гоняются.",
          {"project_dir": DIRP, "summary": {"type": "string", "description": "Что сделано и чем подтверждено"},
           "user_approval": {"type": "string"}, "force": {"type": "boolean"},
-          "waive": {"type": "array", "items": {"type": "string", "enum": ["review", "docs", "baseline", "deps"]},
+          "waive": {"type": "array", "items": {"type": "string", "enum": list(core.WAIVABLE)},
                     "description": "Какие гейты пользователь разрешил снять; согласие относится только к ним"}},
          ["project_dir", "summary"]),
 ]
@@ -162,13 +169,15 @@ def log_error(text: str) -> None:
 def dispatch(name: str, a: dict, progress) -> str:
     d = a.get("project_dir")
     if name == "plan_scout":
-        return flow.scout(d, a.get("questions"), a.get("wait", True), int(a.get("timeout", 300)), progress)
+        return flow.scout(d, a.get("questions"), a.get("wait", True), int(a.get("timeout", 300)), progress,
+                          a.get("profile"))
     if name == "plan_init":
         return flow.init(d, a.get("title"), a.get("goal"), a.get("items"), a.get("review", "auto"), "auto",
                          {k: a.get(k) for k in ("stack", "features", "deploy_rules", "links")}, a.get("docs", "auto"))
     if name == "plan_update":
         return flow.update(d, a.get("add"), a.get("update"), a.get("hold"), a.get("title"), a.get("goal"),
-                           a.get("remove"), a.get("user_approval"), a.get("branch"))
+                           a.get("remove"), a.get("user_approval"), a.get("branch"), a.get("stage_pass"),
+                           a.get("stage_skip"), bool(a.get("accept_config")))
     if name == "plan_run":
         return flow.run(d, a.get("item_ids"), a.get("wait"), int(a.get("timeout", 600)), bool(a.get("fresh")), progress)
     if name == "plan_jobs":
@@ -183,12 +192,13 @@ def dispatch(name: str, a: dict, progress) -> str:
     if name == "plan_show":
         return flow.show(d, a.get("item_id"))
     if name == "plan_review":
-        return flow.review(d, a.get("wait", True), int(a.get("timeout", 900)), a.get("notes"), a.get("screenshots"), progress)
+        return flow.review(d, a.get("wait", True), int(a.get("timeout", 900)), a.get("notes"), a.get("screenshots"),
+                           progress, a.get("stage"))
     if name == "wiki_pages":
         return flow.wiki_pages(d, bool(a.get("include_text")))
     if name == "wiki_publish":
         return flow.wiki_publish(d, a.get("title"), a.get("markdown"), a.get("mode", "upsert"), a.get("parent_title"),
-                                 a.get("notes"), int(a.get("timeout", 600)), progress)
+                                 a.get("notes"), int(a.get("timeout", 600)), progress, a.get("template"))
     if name == "plan_finish":
         return flow.finish(d, a.get("summary"), a.get("user_approval"), bool(a.get("force")), a.get("waive"))
     raise core.PlanError(f"Инструмента {name!r} нет.")
