@@ -73,10 +73,16 @@ class Baseline(ProjectCase):
 
     def test_changed_baseline_file_needs_the_user(self):
         self.done_plan()
-        self.write("cplan.json", json.dumps({"baseline": ["test -f out.txt"]}))  # ослабили проверку в обход хука
+        self.write("cplan.json", json.dumps({"baseline": ["touch ran.marker"]}))  # подменили проверку в обход хука
         with self.assertRaises(core.PlanError) as ctx:
             flow.finish(self.dir, "готово, проверки пунктов прошли")
         self.assertIn("cplan.json изменён после создания плана", str(ctx.exception))
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "ran.marker")))  # подменённая команда не исполнялась
+        self.assertNotIn("baseline", self.plan())
+        out = flow.finish(self.dir, "готово, проверки пунктов прошли", user_approval="да, закрывай так",
+                          waive=["baseline"])
+        self.assertIn("закрыт", out)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "ran.marker")))
 
     def test_broken_baseline_file_is_loud(self):
         self.done_plan()
@@ -108,6 +114,16 @@ class Baseline(ProjectCase):
         with self.assertRaises(core.PlanError):
             core.normalize_files(["cplan.json"], self.dir, "пункт 2")
 
+    def test_symlinked_baseline_file_is_guarded_too(self):
+        os.makedirs(os.path.join(self.dir, "conf"))
+        os.replace(os.path.join(self.dir, "cplan.json"), os.path.join(self.dir, "conf", "planner.json"))
+        os.symlink(os.path.join("conf", "planner.json"), os.path.join(self.dir, "cplan.json"))
+        for name in ("cplan.json", os.path.join("conf", "planner.json")):  # и по имени ссылки, и по имени её цели
+            edit = hook("plan_gate", {"tool_name": "Edit", "tool_input": {"file_path": os.path.join(self.dir, name)}})
+            self.assertEqual(edit["hookSpecificOutput"]["permissionDecision"], "deny", name)
+        with self.assertRaises(core.PlanError):
+            core.normalize_files(["conf/planner.json"], self.dir, "пункт 2")
+
 
 class Dependencies(ProjectCase):
     def setUp(self):
@@ -138,6 +154,21 @@ class Dependencies(ProjectCase):
         self.assertIn("Манифесты зависимостей менялись: requirements.txt", out)
         self.assertEqual(self.plan()["deps_changed"], ["requirements.txt"])
         self.assertIn("requirements.txt", self.plan()["user_override"]["gates"][0])
+
+    def test_manifest_edited_before_the_plan_is_not_the_plans_change(self):
+        self.write("requirements.txt", "requests==2.32.0\nrich==13.7\n")  # правка пользователя до плана, без коммита
+        self.done_plan()
+        self.assertEqual(list(self.plan()["dep_dirty"]), ["requirements.txt"])
+        self.assertIn("закрыт", flow.finish(self.dir, "готово, проверки пунктов прошли"))
+        self.assertNotIn("deps_changed", self.plan())
+
+    def test_manifest_edited_before_and_again_during_the_plan_counts(self):
+        self.write("requirements.txt", "requests==2.32.0\nrich==13.7\n")
+        self.done_plan()
+        self.write("requirements.txt", "requests==2.32.0\nrich==13.7\nleft-pad==1.0\n")
+        with self.assertRaises(core.PlanError) as ctx:
+            flow.finish(self.dir, "готово, проверки пунктов прошли")
+        self.assertIn("изменены манифесты зависимостей: requirements.txt", str(ctx.exception))
 
     def test_mixed_manifests_are_judged_by_added_lines(self):
         base = core.git_head(self.dir)

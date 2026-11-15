@@ -262,14 +262,24 @@ def light_budget(root: str, path: str) -> str | None:
     return None
 
 
+def is_project_file(raw: str, real: str) -> bool:
+    """Путь ведёт к cplan.json в корне проекта: по имени, через симлинк или по имени его цели."""
+    for cand in dict.fromkeys((raw, real)):
+        root = project_root(cand)
+        if root and os.path.realpath(os.path.join(root, PROJECT_FILE)) == real:
+            return True
+    return False
+
+
 def plan_gate(data: dict) -> dict:
     inp = data.get("tool_input") or {}
     path = inp.get("file_path") or inp.get("notebook_path")
     if not PLAN_GATE or not isinstance(path, str) or not path:
         return {}
-    path = os.path.realpath(os.path.join(str(data.get("cwd") or ""), os.path.expanduser(path)))
+    raw = os.path.abspath(os.path.join(str(data.get("cwd") or ""), os.path.expanduser(path)))
+    path = os.path.realpath(raw)
     own = os.path.join(os.path.realpath(os.path.expanduser("~")), ".claude") + os.sep  # память, настройки, скиллы
-    if os.path.basename(path) == PROJECT_FILE and project_root(path) == os.path.dirname(path):
+    if is_project_file(raw, path):
         return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                        "permissionDecisionReason": f"{PROJECT_FILE} задаёт базовые проверки проекта, "
                                        "его правит только пользователь. Нужна другая проверка — предложи её "

@@ -35,8 +35,13 @@ class ProjectCase(unittest.TestCase):
             fh.write(".fake*\n")  # служебные файлы подставного claude — не правки проекта
         self._env = {k: os.environ.get(k) for k in ("CPLAN_CLAUDE_BIN", "HOME", "CPLAN_SANDBOX", "CPLAN_ENV_SCRUB",
                                                      "CPLAN_VERIFY_DENY", "GITLAB_TOKEN", "DB_PASSWORD",
-                                                     "ANTHROPIC_API_KEY", "CPLAN_PLAIN")}
-        for name in ("CPLAN_SANDBOX", "CPLAN_ENV_SCRUB", "CPLAN_VERIFY_DENY"):
+                                                     "ANTHROPIC_API_KEY", "CPLAN_PLAIN", "CI_JOB_JWT",
+                                                     "DOCKER_AUTH_CONFIG", "KUBECONFIG", "AWS_SHARED_CREDENTIALS_FILE",
+                                                     "AWS_CONFIG_FILE", "GOOGLE_APPLICATION_CREDENTIALS",
+                                                     "DOCKER_CONFIG", "NETRC", "CLAUDE_CODE_USE_BEDROCK")}
+        for name in ("CPLAN_SANDBOX", "CPLAN_ENV_SCRUB", "CPLAN_VERIFY_DENY", "KUBECONFIG",
+                     "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE", "GOOGLE_APPLICATION_CREDENTIALS", "DOCKER_CONFIG",
+                     "NETRC", "CLAUDE_CODE_USE_BEDROCK"):
             os.environ.pop(name, None)
         os.environ["CPLAN_CLAUDE_BIN"] = FAKE
         self.home = tempfile.mkdtemp(prefix="cplan-home-")

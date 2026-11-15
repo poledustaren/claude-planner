@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import urllib.error
@@ -45,16 +46,17 @@ _TRIVIAL = re.compile(r"(?:true|:|exit(?:\s+0)?|echo(?:\s.*)?|/(?:usr/)?bin/true
 _SWALLOW = re.compile(r"\|\|\s*(?:true|:|exit\s+0|echo\b[^|&;]*)\s*$")
 # Проверка только читает и запускает: команды, которые меняют состояние git, хост или уходят на другой узел, в verify
 # не принимаются. Планер исполняет verify сам, без вопроса пользователю, — это не должен быть обходной канал.
+_GIT_OPTS = r"(?:\s+(?:-[Cc]\s+\S+|--(?:git-dir|work-tree|namespace)(?:=|\s+)\S+|-{1,2}[\w-]+(?:=\S+)?))*"
 _DANGER = (
     (re.compile(r"(?:sudo|doas)(?=\s|$)|su\s+-"), "повышает права"),
-    (re.compile(r"git\s+(?:push|commit|reset|clean|checkout|switch|restore|stash|rebase|merge)(?=\s|$)"),
+    (re.compile(r"git" + _GIT_OPTS
+                + r"\s+(?:push|commit|reset|clean|checkout|switch|restore|stash|rebase|merge)(?=\s|$)"),
      "меняет состояние git"),
     (re.compile(r"(?:ssh|scp|rsync)(?=\s|$)"), "ходит на другой узел — для этого есть проверка type \"node\""),
     (re.compile(r"(?:systemctl|shutdown|reboot|pkill|killall|mkfs\S*)(?=\s|$)"), "управляет хостом"),
-    (re.compile(r"rm\s+(?:-\w+\s+)*-\w*[rR]\w*\s+(?:-\w+\s+)*(?:/|~|\$HOME)(?:\s|/|$)"), "удаляет вне проекта"),
 )
 _PIPE_SH = re.compile(r"(?:curl|wget)\b[^|;&\n]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b")
-_ENV_PREFIX = re.compile(r"^(?:(?:\w+=\S*|then|do|else|exec|env|nohup|time|xargs)\s+)+")
+_ENV_PREFIX = re.compile(r"^(?:(?:\w+=\S*|then|do|else|exec|env|nohup|time|xargs|command|builtin)\s+)+")
 CONFIG_FILE = "~/.config/claude-planner/config.json"
 PROJECT_FILE = "cplan.json"   # в корне проекта: базовые проверки, которые задаёт пользователь, а не модель
 WAIVABLE = ("review", "docs", "baseline", "deps")
@@ -276,6 +278,27 @@ def config() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _rm_outside(part: str) -> bool:
+    """rm -r с целью вне проекта: абсолютный путь, ~, переменная или выход через «..»."""
+    try:
+        words = shlex.split(part)
+    except ValueError:
+        words = [w.strip("\"'") for w in part.split()]
+    if not words or os.path.basename(words[0].lstrip("\\")) != "rm":
+        return False
+    flags, targets, rest = [], [], False
+    for w in words[1:]:
+        if rest or not w.startswith("-") or w == "-":
+            targets.append(w)
+        elif w == "--":
+            rest = True
+        else:
+            flags.append(w)
+    if not any(f == "--recursive" or (not f.startswith("--") and re.search(r"[rR]", f)) for f in flags):
+        return False
+    return any(t.startswith(("/", "~", "$")) or ".." in t.split("/") for t in targets)
+
+
 def dangerous_cmd(cmd: str) -> str | None:
     """Причина, по которой команда не годится в проверку, или None. CPLAN_VERIFY_DENY=0 — выключить."""
     if os.environ.get("CPLAN_VERIFY_DENY") == "0":
@@ -287,6 +310,8 @@ def dangerous_cmd(cmd: str) -> str | None:
         for pattern, why in _DANGER:
             if pattern.match(part):
                 return why
+        if _rm_outside(part):
+            return "удаляет вне проекта"
     return None
 
 
@@ -332,7 +357,8 @@ def normalize_check(c, where: str, trusted: bool = False) -> dict:
                             "пользователя.")
         return {"type": "cmd", "cmd": cmd.strip(),
                 "timeout": _int(c.get("timeout"), DEFAULT_TIMEOUT, where, "timeout", 1, MAX_TIMEOUT),
-                "expect_exit": _int(c.get("expect_exit"), 0, where, "expect_exit"), **extra}
+                "expect_exit": _int(c.get("expect_exit"), 0, where, "expect_exit"), **extra,
+                **({"trusted": True} if trusted else {})}
     if kind == "node":
         server, cmd = c.get("server"), c.get("cmd")
         if not isinstance(server, str) or not server.strip() or not isinstance(cmd, str) or not cmd.strip():
@@ -389,7 +415,8 @@ def normalize_files(raw, root: str, where: str) -> list[str]:
         rel = f[4:].strip() if new else f
         if os.path.isabs(rel) and (rel + os.sep).startswith(root + os.sep):
             rel = os.path.relpath(rel, root)
-        if os.path.normpath(rel) == PROJECT_FILE:
+        if os.path.normpath(rel) == PROJECT_FILE or \
+                os.path.realpath(os.path.join(root, rel)) == os.path.realpath(os.path.join(root, PROJECT_FILE)):
             raise PlanError(f"{where}: {PROJECT_FILE} задаёт базовые проверки проекта, его правит только пользователь — "
                             "в files пункта он не входит.")
         if not new and not os.path.exists(os.path.join(root, rel)):
@@ -581,9 +608,10 @@ def init(root: str, title: str, goal: str, items, review="auto", track="auto", r
             stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             atomic_write(pdir(root, "archive", f"{stamp}-{slugify(old['title'])}.json"),
                          json.dumps(old, ensure_ascii=False, indent=1))
+        head = git_head(root)
         plan = {"version": 1, "root": root, "project": os.path.basename(root), "title": title.strip(),
-                "goal": goal.strip(), "status": "active", "created_at": now(), "base_rev": git_head(root),
-                "branch": git_branch(root), "baseline_sha": conf_digest(root),
+                "goal": goal.strip(), "status": "active", "created_at": now(), "base_rev": head,
+                "branch": git_branch(root), "baseline_sha": conf_digest(root), "dep_dirty": dep_dirty(root, head),
                 "review_mode": review, "track": track, "docs": {"mode": docs, "published": []},
                 "items": [], "history": []}
         _append_items(plan, items, root)
@@ -781,6 +809,10 @@ def run_check(root: str, c: dict) -> tuple[bool, str, str]:
     """Возвращает (прошла, краткая причина, полный вывод)."""
     kind = c["type"]
     if kind == "cmd":
+        # Фильтр стоит и здесь, а не только на входе: проверка могла попасть в план до его появления или мимо него.
+        danger = None if c.get("trusted") else dangerous_cmd(c["cmd"])
+        if danger:
+            return False, f"не исполнялась: {danger}", f"[команда не исполнялась: {danger}]"
         proc = subprocess.Popen([*verify_wrap(root), "bash", "-lc", c["cmd"]], cwd=root, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
         try:
@@ -938,12 +970,16 @@ def fail_report(item: dict, ev: dict, tail: int = TAIL) -> str:
 
 # ───────────────────────── базовые проверки проекта и зависимости ─────────────────────────
 
-def conf_digest(root: str) -> str:
+def file_digest(path: str) -> str:
     try:
-        with open(os.path.join(root, PROJECT_FILE), "rb") as fh:
+        with open(path, "rb") as fh:
             return hashlib.sha256(fh.read()).hexdigest()
     except OSError:
         return ""
+
+
+def conf_digest(root: str) -> str:
+    return file_digest(os.path.join(root, PROJECT_FILE))
 
 
 def project_conf(root: str) -> dict:
@@ -988,13 +1024,15 @@ def baseline_gate(root: str, plan: dict, by: str) -> str | None:
     """Причина, по которой базовые проверки не дают идти дальше, или None. Чеклист из одних light их не гоняет."""
     if not heavy(plan):
         return None
-    why = []
     if "baseline_sha" in plan and conf_digest(root) != plan["baseline_sha"]:
-        why.append(f"{PROJECT_FILE} изменён после создания плана, а базовые проверки задаёт пользователь")
+        # Изменённые команды не исполняем: сначала их должен увидеть пользователь.
+        return (f"{PROJECT_FILE} изменён после создания плана, базовые проверки не запускались: их задаёт пользователь, "
+                "и изменённые команды он должен увидеть до запуска. Покажи ему разницу; вернуть файл к прежнему виду "
+                "может только он")
     ev = run_baseline(root, by)
     if ev and not ev["passed"]:
-        why.append("базовые проверки проекта не прошли: " + fail_summary(ev) + f" (лог: {ev['log']})")
-    return "; ".join(why) or None
+        return "базовые проверки проекта не прошли: " + fail_summary(ev) + f" (лог: {ev['log']})"
+    return None
 
 
 def dep_policy() -> str:
@@ -1010,8 +1048,10 @@ def _git_out(root: str, *args: str) -> str:
         return ""
 
 
-def dep_changes(root: str, base_rev: str) -> list[str]:
-    """Манифесты зависимостей, изменённые с начала плана: новая зависимость — решение человека, а не агента."""
+def dep_changes(root: str, base_rev: str, known: dict | None = None) -> list[str]:
+    """Манифесты зависимостей, изменённые с начала плана: новая зависимость — решение человека, а не агента.
+
+    known — отпечатки манифестов, которые были изменены ещё до плана (dep_dirty): не тронутые с тех пор не в счёт."""
     if not base_rev:
         return []
     extra = project_conf(root).get("dep_files")
@@ -1033,7 +1073,15 @@ def dep_changes(root: str, base_rev: str) -> list[str]:
             out.append(rel)
         elif re.search(pattern, _git_out(root, "diff", "-U0", base_rev, "--", rel), re.M):
             out.append(rel)
-    return out
+    return [rel for rel in out if not known or known.get(rel) != file_digest(os.path.join(root, rel))]
+
+
+def dep_dirty(root: str, base_rev: str) -> dict[str, str]:
+    """Манифесты, изменённые ещё до плана (рабочее дерево не было чистым), с отпечатками на момент его создания."""
+    try:
+        return {rel: file_digest(os.path.join(root, rel)) for rel in dep_changes(root, base_rev)}
+    except PlanError:   # битый cplan.json создание плана не останавливает — о нём скажет закрытие
+        return {}
 
 
 def finish_blockers(plan: dict) -> list[str]:
@@ -1125,10 +1173,10 @@ def finish(root: str, summary: str, user_approval: str | None = None, force: boo
     why = baseline_gate(root, plan, by="finish")
     if why:
         late["baseline"] = why
-    deps = dep_changes(root, plan.get("base_rev") or "") if dep_policy() != "off" else []
+    deps = dep_changes(root, plan.get("base_rev") or "", plan.get("dep_dirty")) if dep_policy() != "off" else []
     if deps and dep_policy() == "ask":
         late["deps"] = ("изменены манифесты зависимостей: " + ", ".join(deps[:8])
-                        + " — новая зависимость проходит только с согласия пользователя")
+                        + " — новая зависимость или версия проходит только с согласия пользователя")
     stuck = [late[k] for k in late if k not in waive]
     if stuck:
         raise PlanError("Закрыть нельзя: " + "; ".join(stuck) + ". " + LATE_WAY_OUT)

@@ -46,8 +46,11 @@ SCRUB_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "
              "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_EXECPATH",
              "CLAUDE_CODE_PLUGIN_DIRS")  # последнее — чтобы панель прогресса не грузилась в воркеров
 # Имена переменных окружения, похожие на секрет: воркеру они не нужны, а утечь через Bash могут.
-SECRET_ENV = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|ACCESS_KEY|API_?KEY|_KEYS?$|_PAT$|_DSN$|"
-                        r"DATABASE_URL|CONNECTION_?STRING", re.I)
+SECRET_ENV = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|ACCESS_KEY|API_?KEY|AUTH_CONFIG|_KEYS?$|_PAT$|_DSN$|"
+                        r"_JWT$|DATABASE_URL|CONNECTION_?STRING", re.I)
+# Переменные-указатели на файл с реквизитами: воркеру не передаются, а сам файл закрывается от чтения, как SECRET_PATHS.
+CRED_FILE_ENV = ("KUBECONFIG", "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE", "GOOGLE_APPLICATION_CREDENTIALS",
+                 "DOCKER_CONFIG", "NETRC")
 KEEP_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")  # аутентификация самого claude
 # Реквизиты на диске: закрыты и для Read (правила запрета), и для Bash (denyRead песочницы).
 SECRET_PATHS = ("~/.ssh", "~/.aws", "~/.kube", "~/.gnupg", "~/.docker/config.json", "~/.netrc", "~/.npmrc", "~/.pypirc",
@@ -142,6 +145,25 @@ def _sandbox_conf() -> dict:
     return conf if isinstance(conf, dict) else {}
 
 
+def cred_files() -> list[str]:
+    """Файлы реквизитов, на которые указывает окружение (KUBECONFIG=/work/prod.yaml и т. п.), абсолютными путями."""
+    out = []
+    for name in CRED_FILE_ENV:
+        for raw in (os.environ.get(name) or "").split(os.pathsep):
+            path = os.path.expanduser(raw.strip())
+            if os.path.isabs(path):
+                out.append(os.path.normpath(path))
+    return list(dict.fromkeys(out))
+
+
+def _rule_path(path: str) -> str:
+    """Путь в синтаксисе правил Read: ~/… — от дома, //… — от корня ФС (одиночный / там значит «от корня проекта»)."""
+    home = os.path.expanduser("~")
+    if path == home or path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return "/" + path if path.startswith("/") and not path.startswith("//") else path
+
+
 def sandbox() -> dict | None:
     """Блок sandbox для --settings воркера; None — выключена (CPLAN_SANDBOX=0 или {"sandbox": {"enabled": false}}).
 
@@ -155,14 +177,14 @@ def sandbox() -> dict | None:
     return {"enabled": True, "autoAllowBashIfSandboxed": False, "allowUnsandboxedCommands": False,
             "failIfUnavailable": bool(conf.get("strict")),
             "filesystem": {"allowWrite": _strs(conf["write"]) if isinstance(conf.get("write"), list) else list(CACHE_PATHS),
-                           "denyRead": [*SECRET_PATHS, *_strs(conf.get("deny_read"))]},
+                           "denyRead": [*SECRET_PATHS, *cred_files(), *_strs(conf.get("deny_read"))]},
             "network": {"allowedDomains": _strs(conf.get("domains"))}}
 
 
 def secret_rules() -> list[str]:
     """Запрет Read на реквизиты: встроенные файловые инструменты идут мимо песочницы Bash."""
-    paths = [*SECRET_PATHS, *_strs(_sandbox_conf().get("deny_read"))]
-    return [rule for p in paths for rule in (f"Read({p})", f"Read({p}/**)")]
+    paths = [*SECRET_PATHS, *cred_files(), *_strs(_sandbox_conf().get("deny_read"))]
+    return [rule for p in map(_rule_path, paths) for rule in (f"Read({p})", f"Read({p}/**)")]
 
 
 def claude_bin() -> str:
@@ -217,14 +239,14 @@ def child_env() -> dict:
     """Окружение воркера без секретов родителя: имена, похожие на токен или пароль, вырезаются.
 
     Остаются KEEP_ENV (ими аутентифицируется сам claude), реквизиты облака при Bedrock/Vertex и имена из
-    {"worker_env_keep": [...]} конфига. CPLAN_ENV_SCRUB=0 — передать всё как есть."""
+    {"worker_env_keep": [...]} конфига — всё оставленное видно и Bash воркера. CPLAN_ENV_SCRUB=0 — передать всё как есть."""
     env = {k: v for k, v in os.environ.items() if k not in SCRUB_ENV}
     if os.environ.get("CPLAN_ENV_SCRUB") != "0":
         keep = {*KEEP_ENV, *_strs(core.config().get("worker_env_keep"))}
         cloud = (("AWS_",) if env.get("CLAUDE_CODE_USE_BEDROCK") else ()) \
             + (("GOOGLE_", "CLOUD_ML_", "ANTHROPIC_VERTEX_") if env.get("CLAUDE_CODE_USE_VERTEX") else ())
         env = {k: v for k, v in env.items()
-               if k in keep or (cloud and k.startswith(cloud)) or not SECRET_ENV.search(k)}
+               if k in keep or (cloud and k.startswith(cloud)) or not (SECRET_ENV.search(k) or k in CRED_FILE_ENV)}
     env["CPLAN_WORKER"] = "1"
     return env
 

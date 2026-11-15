@@ -400,7 +400,8 @@ def review_prompt(plan: dict, notes: str | None, screenshots: list | None) -> st
         parts.append("ПРОШЛЫЙ РАУНД ОТКЛОНЁН, блокеры были:\n" + "\n".join(
             f"- {i.get('file', '')}:{i.get('line', '')} {i['problem']}" for i in rounds[-1]["issues"]
             if i.get("severity") == "blocker") + "\nПроверь, что они устранены, и не выдвигай заново снятые.")
-    deps = core.dep_changes(plan["root"], plan.get("base_rev") or "") if core.dep_policy() != "off" else []
+    deps = (core.dep_changes(plan["root"], plan.get("base_rev") or "", plan.get("dep_dirty"))
+            if core.dep_policy() != "off" else [])
     if deps:
         parts.append("ИЗМЕНЕНЫ МАНИФЕСТЫ ЗАВИСИМОСТЕЙ: " + ", ".join(deps[:8]) + ". По диффу проверь каждую новую "
                      "зависимость: нужна ли она пунктам плана и названа ли в них. Лишняя или необъяснённая — blocker.")
