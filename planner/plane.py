@@ -17,7 +17,7 @@ import subprocess
 import urllib.error
 import urllib.request
 
-from . import core
+from . import core, projects
 
 CONFIG_FILES = ("~/.config/claude-planner/plane.env", "~/.config/agy-planner/plane.env")
 KEYS = ("PLANE_BASE_URL", "PLANE_API_KEY", "PLANE_WORKSPACE_SLUG")
@@ -27,6 +27,7 @@ BOXES = {"done": "☑️", "todo": "⬜", "in_progress": "🔄", "failed": "❌"
 PASSPORT_KEYS = ("stack", "features", "deploy_rules", "links")
 FACTORY = None  # тесты подменяют на фабрику клиента с фейковым транспортом
 ENV_ISSUE, ENV_PROJECT, ENV_KEY = "PLANE_ISSUE_ID", "PLANE_PROJECT_ID", "PLANE_ISSUE_KEY"
+ENV_ASSIGNEE = "PLANE_ASSIGNEE"
 ID_RE = re.compile(r"[0-9a-fA-F-]{8,64}")
 PLAN_MARK = '<hr/><h2 data-cplan="1">План: '
 PLAN_MARK_RE = re.compile(r"<hr\s*/?>\s*<h2[^>]*>\s*План: ")
@@ -37,14 +38,14 @@ class PlaneError(Exception):
     pass
 
 
-def load_config() -> dict:
-    cfg = {k: os.environ.get(k, "") for k in KEYS}
+def load_config(keys: tuple = KEYS) -> dict:
+    cfg = {k: os.environ.get(k, "") for k in keys}
     for path in CONFIG_FILES:
         try:
             with open(os.path.expanduser(path), encoding="utf-8") as fh:
                 for line in fh:
                     key, sep, val = line.strip().removeprefix("export ").partition("=")
-                    if sep and key.strip() in KEYS and not cfg[key.strip()]:
+                    if sep and key.strip() in keys and not cfg[key.strip()]:
                         cfg[key.strip()] = val.strip().strip("'\"")
         except OSError:
             continue
@@ -124,14 +125,6 @@ def adopt_issue(cl: Client, meta: dict, info: dict) -> dict | None:
         return None
     if not issue.get("id"):
         return None
-    if not meta.get("plane_project_id"):  # папка ещё не привязана к проекту Plane — берём проект задачи
-        try:
-            proj = cl.call("GET", cl.ws(f"projects/{project_id}/")) or {}
-        except PlaneError:
-            proj = {}
-        if proj.get("id"):
-            meta["plane_project_id"] = str(proj["id"])
-            meta["plane_project_identifier"] = str(proj.get("identifier") or "PROJ")
     # прошлый план этой же сессии уже дописал свой чек-лист под описание — берём только исходную часть
     origin = PLAN_MARK_RE.split(str(issue.get("description_html") or ""), maxsplit=1)[0]
     info.update(issue_id=str(issue["id"]), adopted=True, adopted_project=project_id,
@@ -274,8 +267,8 @@ def sync_page(cl: Client, project_id: str, root: str, plan: dict | None, meta: d
             page = None
     if not (page or {}).get("id"):
         pages = cl.results(cl.call("GET", base))
-        target = next((p for p in pages if p.get("name") == title), None) or next(
-            (p for p in pages if (p.get("name") or "").strip().startswith(PAGE_TITLE_PREFIX)), None)
+        # в общем проекте у каждой папки свой паспорт: чужую страницу не перезаписываем
+        target = next((p for p in pages if p.get("name") == title), None)
         page = (cl.call("PATCH", f"{base}{target['id']}/", payload) if target
                 else cl.call("POST", base, {**payload, "access": 0})) or {}
     if not page.get("id"):
@@ -290,27 +283,96 @@ def _norm(text: str) -> str:
     return re.sub(r"[^a-z0-9а-яё]", "", (text or "").casefold())
 
 
-def ensure_project(cl: Client, root: str, meta: dict) -> tuple[str, str]:
-    if meta.get("plane_project_id"):
-        return str(meta["plane_project_id"]), str(meta.get("plane_project_identifier") or "PROJ")
-    name = os.path.basename(root)
-    projects = cl.results(cl.call("GET", cl.ws("projects/")))
-    found = next((p for p in projects if _norm(name) in (_norm(p.get("name")), _norm(p.get("identifier")))), None)
-    if found is None:
-        taken = {str(p.get("identifier") or "").upper() for p in projects}
-        base = (re.sub(r"[^A-Za-z0-9]", "", name).upper() or "PROJ")[:9]
-        ident, n = base if len(base) >= 3 else "PROJ" + base, 1
-        while ident in taken:
-            ident, n = base[:8] + str(n), n + 1
-        clean = re.sub(r"\s+", " ", re.sub(r"[&+,:;$^}{*=?@#|'<>.()%!-]+", " ", name)).strip() or "project"
-        desc = f"{meta.get('features') or name} | Стек: {meta.get('stack')} | Путь: {root}"[:250]
-        found = cl.call("POST", cl.ws("projects/"), {"name": clean[:80], "identifier": ident, "network": 2,
-                                                     "description": desc, "page_view": True, "module_view": True,
-                                                     "cycle_view": True, "issue_views_view": True}) or {}
-        if not found.get("id"):
-            raise PlaneError("Plane не вернул id созданного проекта")
-    meta["plane_project_id"] = str(found["id"])
-    meta["plane_project_identifier"] = str(found.get("identifier") or "PROJ")
+def _projects(cl: Client) -> list:
+    """Все проекты воркспейса: список в Plane постраничный."""
+    out, cursor = [], ""
+    for _ in range(20):
+        resp = cl.call("GET", cl.ws("projects/?per_page=100" + (f"&cursor={cursor}" if cursor else "")))
+        out += cl.results(resp)
+        if not (isinstance(resp, dict) and resp.get("next_page_results") and resp.get("next_cursor")):
+            break
+        cursor = str(resp["next_cursor"])
+    return out
+
+
+def _alive(cl: Client, project_id: str) -> bool:
+    """Проект существует и не в архиве. Сбой сети — не повод перепривязывать папку: исключение уйдёт выше."""
+    try:
+        proj = cl.call("GET", cl.ws(f"projects/{project_id}/")) or {}
+    except PlaneError as exc:
+        if "HTTP 404" in str(exc):
+            return False
+        raise
+    return bool(proj.get("id")) and not proj.get("archived_at")
+
+
+def _bind(meta: dict, proj: dict | None, rule: str = "") -> None:
+    prev = str(meta.get("plane_project_id") or "")
+    if proj is None or str(proj.get("id")) != prev:  # проект сменился: статусы и паспорт у него свои
+        for key in ("plane_state_ids", "plane_state_project_id", "plane_page_id", "plane_page_html_sha1"):
+            meta.pop(key, None)
+    if proj is None:
+        for key in ("plane_project_id", "plane_project_identifier", "plane_project_rule"):
+            meta.pop(key, None)
+        return
+    meta["plane_project_id"] = str(proj["id"])
+    meta["plane_project_identifier"] = str(proj.get("identifier") or "PROJ")
+    meta["plane_project_rule"] = rule
+
+
+def _create_project(cl: Client, name: str, root: str, meta: dict, existing: list) -> dict:
+    taken = {str(p.get("identifier") or "").upper() for p in existing}
+    base = (re.sub(r"[^A-Za-z0-9]", "", name).upper() or "PROJ")[:9]
+    ident, n = base if len(base) >= 3 else "PROJ" + base, 1
+    while ident in taken:
+        ident, n = base[:8] + str(n), n + 1
+    clean = re.sub(r"\s+", " ", re.sub(r"[&+,:;$^}{*=?@#|'<>.()%!-]+", " ", name)).strip() or "project"
+    desc = f"{meta.get('features') or name} | Стек: {meta.get('stack')} | Путь: {root}"[:250]
+    made = cl.call("POST", cl.ws("projects/"), {"name": clean[:80], "identifier": ident, "network": 2,
+                                                "description": desc, "page_view": True, "module_view": True,
+                                                "cycle_view": True, "issue_views_view": True}) or {}
+    if not made.get("id"):
+        raise PlaneError("Plane не вернул id созданного проекта")
+    return made
+
+
+def ensure_project(cl: Client, root: str, meta: dict, fresh: bool = False, explicit: str = "",
+                   task_project: str = "") -> tuple[str, str]:
+    """Проект Plane папки по общему правилу (planner/projects.py); ('', '') — папка в Plane не ведётся.
+
+    Привязка хранится в паспорте папки. Перепроверяется на первом обращении нового плана (fresh):
+    проект удалён или в архиве, привязка была «по умолчанию» либо старая, а таблица теперь знает
+    папку. explicit — имя или идентификатор проекта, названный в plan_init: сильнее всех правил.
+    task_project — проект задачи, под которую запущена сессия: им заменяется проект по умолчанию."""
+    bound, rule = str(meta.get("plane_project_id") or ""), str(meta.get("plane_project_rule") or "legacy")
+    if bound and not explicit and (not fresh or (rule == "explicit" and _alive(cl, bound))):
+        return bound, str(meta.get("plane_project_identifier") or "PROJ")
+    existing = _projects(cl)
+    if explicit:
+        proj = projects.find(existing, explicit)
+        if proj is None:
+            raise PlaneError(f"проекта «{explicit}» в Plane нет (plane_project): назови существующий "
+                             "или объяви новый в ~/.config/plane-projects.json")
+        _bind(meta, proj, "explicit")
+        return meta["plane_project_id"], meta["plane_project_identifier"]
+    found = projects.resolve(root, existing)
+    kept = next((p for p in existing if bound and str(p.get("id")) == bound and not p.get("archived_at")), None)
+    if kept is not None and rule == "legacy" and found["rule"] not in ("table", "declared"):
+        found = {"rule": "legacy", "project": kept, "name": str(kept.get("name") or "")}  # таблица папку не знает — старая привязка в силе
+    if found["rule"] == "declared":
+        if any(projects.norm(p.get("name")) == projects.norm(found["name"]) for p in existing):
+            # одноимённый проект лежит в архиве: владелец его убрал — заново не заводим
+            found = {"rule": "default", "project": projects.find(existing, projects.load_table().get("default", projects.DEFAULT_PROJECT)), "name": ""}
+            found["rule"] = "default" if found["project"] else "none"
+        else:  # проект объявлен в таблице, но в Plane его ещё нет — заводим
+            found = {**found, "rule": "table", "project": _create_project(cl, found["name"], root, meta, existing)}
+    if found["rule"] in ("default", "none") and task_project:
+        proj = next((p for p in existing if str(p.get("id")) == task_project and not p.get("archived_at")), None)
+        if proj is not None:
+            found = {"rule": "default", "project": proj, "name": str(proj.get("name") or "")}
+    _bind(meta, found["project"], found["rule"])
+    if found["project"] is None:
+        return "", ""
     return meta["plane_project_id"], meta["plane_project_identifier"]
 
 
@@ -335,6 +397,33 @@ def ensure_states(cl: Client, project_id: str, meta: dict) -> dict:
         roles["in_review"] = made.get("id") or roles.get("in_progress", "")
     meta["plane_state_ids"], meta["plane_state_project_id"] = roles, str(project_id)
     return roles
+
+
+def assignee_id(cl: Client, root: str, meta: dict) -> str:
+    """Исполнитель задач планера — участник Plane с именем из PLANE_ASSIGNEE (по умолчанию claude).
+
+    Ключ API у планера общий с agy-planner, поэтому «я» — это agy: без явного исполнителя задачи claude
+    числятся на доске Agent Hub за agy. Участника нет — исполнителем остаётся владелец ключа."""
+    want = (os.environ.get(ENV_ASSIGNEE) or load_config(("PLANE_ASSIGNEE",)).get("PLANE_ASSIGNEE") or "claude").strip()
+    if meta.get("plane_assignee_id") and meta.get("plane_assignee_name") == want:
+        return str(meta["plane_assignee_id"])
+    found = ""
+    try:
+        for m in cl.results(cl.call("GET", cl.ws("members/"))):
+            if want.casefold() in (str(m.get("display_name") or "").casefold(), str(m.get("email") or "").casefold(),
+                                   str(m.get("id") or "")):
+                found = str(m.get("id") or "")
+                break
+    except PlaneError:
+        found = ""
+    if not found:
+        if not meta.get("plane_user_id"):
+            meta["plane_user_id"] = str((cl.call("GET", "/api/v1/users/me/") or {}).get("id") or "")
+            save_meta(root, meta)
+        return str(meta["plane_user_id"])
+    meta["plane_assignee_id"], meta["plane_assignee_name"] = found, want
+    save_meta(root, meta)
+    return found
 
 
 def issue_html(plan: dict, meta: dict, page_url: str = "") -> str:
@@ -380,22 +469,29 @@ def sync(root: str, extra: dict | None = None) -> str:
             return "Plane не настроен (~/.config/claude-planner/plane.env) — задача и паспорт не заведены."
         meta = enrich_meta(root, plan, extra)
         info = dict(plan.get("plane") or {})
-        if not info.get("issue_id"):
+        fresh = not info.get("issue_id")  # первое обращение плана: тут выбирается и перепроверяется проект
+        if fresh:
             adopt_issue(cl, meta, info)
-        project_id, ident = ensure_project(cl, root, meta)
+        project_id, ident = ensure_project(cl, root, meta, fresh, str((extra or {}).get("plane_project") or "").strip(),
+                                           str(info.get("adopted_project") or ""))
         # подхваченная задача может жить в другом проекте, чем паспорт папки: статусы берём из её проекта
         issue_project = str(info.get("adopted_project") or project_id)
+        if not issue_project:
+            save_meta(root, meta)
+            return ("Plane: папка временная или её проект не определён — задача не заводится "
+                    "(правило: ~/.config/plane-projects.json, явно — plan_init(plane_project=…)).")
         states = ensure_states(cl, project_id, meta) if issue_project == project_id else ensure_states(cl, issue_project, {})
         save_meta(root, meta)
         docs = all_docs(plan, meta)
         if docs:
             meta["outline_docs"] = docs
         page_note = page_url = ""
-        try:
-            page_id = sync_page(cl, project_id, root, plan, meta)
-            page_url = f"{cl.base_url}/{cl.workspace}/projects/{project_id}/pages/{page_id}"
-        except PlaneError as exc:
-            page_note = f" Паспорт не обновлён: {exc}."
+        if project_id:  # у временной папки с подхваченной задачей паспорта нет
+            try:
+                page_id = sync_page(cl, project_id, root, plan, meta)
+                page_url = f"{cl.base_url}/{cl.workspace}/projects/{project_id}/pages/{page_id}"
+            except PlaneError as exc:
+                page_note = f" Паспорт не обновлён: {exc}."
         save_meta(root, meta)
         finished = plan["status"] == "finished"
         body = issue_html(plan, meta, page_url)
@@ -410,11 +506,10 @@ def sync(root: str, extra: dict | None = None) -> str:
         if info.get("issue_id"):
             issue = cl.call("PATCH", cl.ws(f"projects/{issue_project}/work-items/{info['issue_id']}/"), payload) or {}
         else:
-            if not meta.get("plane_user_id"):
-                meta["plane_user_id"] = str((cl.call("GET", "/api/v1/users/me/") or {}).get("id") or "")
-                save_meta(root, meta)
-            if meta["plane_user_id"]:
-                payload["assignees"] = [meta["plane_user_id"]]
+            # в «Новых» хаб запускает задачи исполнителя сам: исполнителя ставим только задаче, которая уже в работе
+            assignee = assignee_id(cl, root, meta) if state and state != states.get("todo") else ""
+            if assignee:
+                payload["assignees"] = [assignee]
             issue = cl.call("POST", cl.ws(f"projects/{project_id}/work-items/"), payload) or {}
             if not issue.get("id"):
                 raise PlaneError("Plane не вернул id созданной задачи")

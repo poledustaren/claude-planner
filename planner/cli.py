@@ -15,7 +15,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
-from planner import core, flow, workers  # noqa: E402
+from planner import core, flow, hub, workers  # noqa: E402
 
 
 def snapshot(root: str) -> str:
@@ -28,7 +28,12 @@ def snapshot(root: str) -> str:
 
 def main(argv: list[str]) -> int:
     args = argv[1:]
-    cmd = args.pop(0) if args and args[0] in ("status", "watch", "logs", "json") else "status"
+    cmd = args.pop(0) if args and args[0] in ("status", "watch", "logs", "json", "hub-phase") else "status"
+    if cmd == "hub-phase":  # зовут хуки Stop и UserPromptSubmit сессии вне хаба: <папка> <busy|idle>
+        plan = core.load(args[0], required=False) if len(args) == 2 else None
+        if plan:
+            hub.notify(plan, flow.snapshot(args[0]), phase=args[1])
+        return 0
     if cmd == "json":
         seen, plans = set(), []
         for path in args or [os.getcwd()]:

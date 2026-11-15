@@ -69,7 +69,7 @@ def next_hint(root: str, plan: dict) -> str:
 
 def _tail(root: str, extra: str = "") -> str:
     plan = core.load(root)
-    hub.notify(plan)
+    hub.notify(plan, snapshot(root) if hub.target(plan) else None)
     return "\n".join(x for x in (extra, "План: " + core.status_line(plan), next_hint(root, plan)) if x)
 
 
@@ -591,6 +591,28 @@ def wiki_publish(project_dir: str, title: str, markdown: str | None = None, mode
     return _tail(root, "\n".join(x for x in (head, plane.sync(root)) if x))
 
 
+def _evidence(item: dict) -> dict:
+    """Последняя запись проверки пункта в форме события хаба."""
+    ev = item["evidence"][-1]
+    out = {"passed": bool(ev.get("passed")),
+           "label": "; ".join(core.check_label(c) for c in item.get("verify") or [])}
+    if ev.get("note"):
+        out["note"] = ev["note"]
+    if ev.get("ts"):
+        out["at"] = ev["ts"]
+    return out
+
+
+def _scout(job: dict) -> dict:
+    """Бриф разведчика: вопрос из промпта задания, отчёт из телеметрии."""
+    v = workers.view(job)
+    out = {"id": job["id"], "question": str(job.get("prompt") or "").strip()[:300],
+           "model": v["model"] or "", "status": v["status"], "sec": v["sec"]}
+    if v["report"]:
+        out["brief"] = v["report"][:1500]
+    return out
+
+
 def snapshot(project_dir: str) -> dict | None:
     """Снимок плана и воркеров для панели прогресса; None — плана нет."""
     try:
@@ -600,21 +622,36 @@ def snapshot(project_dir: str) -> dict | None:
         return None
     if plan is None:
         return None
+    now = time.time()
     waves = core.compute_waves(plan["items"]) if plan["items"] else {}
-    jobs = [workers.view(j) for j in workers.list_jobs(root)
-            if j["status"] in workers.ACTIVE or time.time() - j.get("ended", 0) < 120]
+    listed = workers.list_jobs(root)
+    jobs = [workers.view(j) for j in listed
+            if j["status"] in workers.ACTIVE or now - j.get("ended", 0) < 120]
+    active = {j["item"]: j["job"] for j in jobs if j["status"] in workers.ACTIVE and j["item"]}
+    scouts = [_scout(j) for j in sorted(
+        (j for j in listed if j["kind"] == "scout" and (j.get("ended") or now) >= now - 6 * 3600),
+        key=lambda j: j.get("started", 0), reverse=True)[:4]]
     done = sum(i["status"] in core.CLOSED for i in plan["items"])
-    return {"root": root, "project": plan["project"], "title": plan["title"], "status": plan["status"],
+    snap = {"root": root, "project": plan["project"], "title": plan["title"], "status": plan["status"],
+            "goal": plan.get("goal") or "", "updatedAt": plan.get("updated_at") or "",
             "done": done, "total": len(plan["items"]), "hold": plan.get("hold") or "",
             "issue": (plan.get("plane") or {}).get("issue_key") or "",
             "isActive": plan["status"] != "finished" or any(j["status"] in workers.ACTIVE for j in jobs),
             "items": [{"id": i["id"], "title": i["title"], "tier": i["tier"], "status": i["status"],
-                       "wave": waves.get(i["id"], 0)} for i in plan["items"]],
+                       "wave": waves.get(i["id"], 0), "acceptance": i.get("acceptance") or "",
+                       "files": i.get("files") or [], "dependsOn": list(i.get("depends_on") or []),
+                       **({"light": i["light"]} if i.get("light") else {}),
+                       **({"evidence": _evidence(i)} if i.get("evidence") else {}),
+                       **({"agent": active[i["id"]]} if i["id"] in active else {})} for i in plan["items"]],
             "jobs": [{"id": j["job"], "item": j["item"] or "", "kind": j["kind"], "tier": j["tier"],
                       "model": j["model"] or "", "status": j["status"], "sec": j["sec"], "steps": j["steps"],
                       "ctxK": j["ctx"] // 1000, "cost": j["cost"], "last": j["last"][:120],
-                      "isRunning": j["status"] in workers.ACTIVE} for j in jobs],
-            "next": next_hint(root, plan)}
+                      "isRunning": j["status"] in workers.ACTIVE, "report": j["report"][:1500],
+                      "reason": j["reason"]} for j in jobs],
+            "scouts": scouts, "next": next_hint(root, plan)}
+    if plan["status"] == "finished" and plan.get("summary"):
+        snap["summary"] = plan["summary"]
+    return snap
 
 
 def finish(project_dir: str, summary: str, user_approval: str | None = None, force: bool = False) -> str:
@@ -627,7 +664,7 @@ def finish(project_dir: str, summary: str, user_approval: str | None = None, for
     elif live:
         raise core.PlanError(f"Ещё работают воркеры ({len(live)}). Дождись plan_jobs(wait=true, mode=\"all\") или останови.")
     plan = core.finish(root, summary, user_approval, force)
-    hub.notify(plan)
+    hub.notify(plan, snapshot(root) if hub.target(plan) else None)
     for job in workers.list_jobs(root):
         workers.cleanup_session(job)
     cost = sum(workers.view(j)["cost"] for j in workers.list_jobs(root))

@@ -5,6 +5,10 @@ import unittest
 
 from helpers import ProjectCase, core, flow, item, outline, plane, workers
 
+# Сессия хаба может нести задачу Plane в окружении; тесты работают со своими фабриками.
+for _key in (plane.ENV_ISSUE, plane.ENV_PROJECT, plane.ENV_KEY):
+    os.environ.pop(_key, None)
+
 OK = "def a():\n    return 42\n"
 CHECK = ["python3 -c 'import a,sys; sys.exit(0 if a.a()==42 else 1)'"]
 
@@ -231,12 +235,20 @@ class Review(ProjectCase):
 class FakePlane:
     def __init__(self, project_name):
         self.log, self.pages, self.issues, self.project_name = [], {}, {}, project_name
+        self.extra_projects, self.members, self.created_project = [], [], {}
 
     def __call__(self, method, path, payload=None):
         tail = path.split("/workspaces/ws/")[-1]
         self.log.append((method, tail))
-        if tail == "projects/" and method == "GET":
-            return {"results": [{"id": "p1", "name": self.project_name, "identifier": "TST"}]}
+        if tail.startswith("projects/?") and method == "GET":
+            return {"results": [{"id": "p1", "name": self.project_name, "identifier": "TST"}, *self.extra_projects]}
+        if tail == "members/":
+            return self.members
+        if tail == "projects/" and method == "POST":
+            return dict(self.created_project)
+        if tail.startswith("projects/") and tail.count("/") == 2 and method == "GET":
+            pid = tail.split("/")[1]
+            return next((p for p in [{"id": "p1", "identifier": "TST"}, *self.extra_projects] if p["id"] == pid), {})
         if tail.endswith("/states/") and method == "GET":
             return [{"id": "s1", "name": "In Progress", "group": "started"}, {"id": "s2", "name": "В проверке", "group": "started"}]
         if path.endswith("/users/me/"):
@@ -424,6 +436,7 @@ class PlaneAndWiki(ProjectCase):
         with open(os.path.join(self.dir, ".planner", "project_meta.json"), "w") as fh:
             json.dump({"plane_project_id": "p9", "plane_project_identifier": "OLD", "plane_page_id": "pg9",
                        "stack": "Go", "outline_docs": [{"title": "Старая дока", "url": "https://wiki.test/doc/old"}]}, fh)
+        self.pl.extra_projects = [{"id": "p9", "name": "old project", "identifier": "OLD"}]
         out = flow.init(self.dir, "План", "функция a возвращает 42", [item()])
         self.assertIn("OLD-7", out)
         self.assertIn(("PATCH", "projects/p9/pages/pg9/"), self.pl.log)
@@ -523,7 +536,25 @@ class PlaneAndWiki(ProjectCase):
         snap = flow.snapshot(self.dir)
         self.assertEqual((snap["done"], snap["total"], snap["isActive"], snap["issue"]), (0, 2, True, "TST-7"))
         self.assertEqual([i["wave"] for i in snap["items"]], [1, 2])
+        self.assertEqual((snap["goal"], snap["updatedAt"] != "", snap["next"] != ""),
+                         ("функция a возвращает 42", True, True))
+        self.assertNotIn("summary", snap)
+        first, second = snap["items"]
+        self.assertEqual((first["acceptance"], first["files"], first["dependsOn"], first["status"], first["tier"]),
+                         ("файл содержит нужную строку", [], [], "todo", "main"))
+        self.assertEqual(second["dependsOn"], ["1"])
+        self.assertNotIn("evidence", first)
+        self.assertEqual((snap["jobs"], snap["scouts"]), ([], []))
         self.assertIsNone(flow.snapshot(os.environ["HOME"]))
+
+    def test_snapshot_carries_evidence(self):
+        flow.init(self.dir, "План", "функция a возвращает 42", [item()])
+        self.write("out.txt", "ok")
+        flow.run(self.dir, wait=False)
+        flow.verify(self.dir)
+        ev = flow.snapshot(self.dir)["items"][0]["evidence"]
+        self.assertEqual((ev["passed"], ev["label"]), (True, "test -f out.txt"))
+        self.assertTrue(ev["at"])
 
 
 if __name__ == "__main__":

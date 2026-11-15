@@ -9,7 +9,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from planner import core, flow, outline, plane, workers  # noqa: E402,F401
+from planner import core, flow, outline, plane, projects, workers  # noqa: E402,F401
 
 FAKE = os.path.join(ROOT, "tests", "fake_claude.py")
 
@@ -37,6 +37,8 @@ class ProjectCase(unittest.TestCase):
         os.environ["HOME"] = self.home  # конфиги, кэш хуков и сессии — в песочнице
         plane.FACTORY = lambda: None
         outline.FACTORY = lambda: None
+        # тестовый проект лежит в /tmp: снимаем правило «временная папка в Plane не ведётся»
+        self._scratch, projects.SCRATCH_ROOTS = projects.SCRATCH_ROOTS, ()
         self.scenario({})
 
     def tearDown(self):
@@ -49,6 +51,7 @@ class ProjectCase(unittest.TestCase):
                 os.environ[k] = v
         plane.FACTORY = None
         outline.FACTORY = None
+        projects.SCRATCH_ROOTS = self._scratch
         shutil.rmtree(self.dir, ignore_errors=True)
         shutil.rmtree(self.home, ignore_errors=True)
 

@@ -19,6 +19,8 @@ description: "Вести правки в проекте через MCP planner: 
 
 Каждый план сам заводит задачу в Plane и обновляет паспорт проекта в Pages; закрытие плана переводит задачу в «В проверке». Вручную через MCP `plane` задачи для плана не создавай — будут дубли.
 
+**Проект Plane выбирается по правилу, а не по имени папки** (оно общее с agy-planner): привязка папки в `.cplan/meta.json` → временная папка (`/tmp`, кэш) в Plane не ведётся → таблица `~/.config/plane-projects.json` (папка, папки выше неё, основной репозиторий рабочего дерева git или origin → проект) → совпадение имени с существующим проектом → общий проект «исследования». Новый проект планер заводит, только если он объявлен в таблице. Правило выбрало бы не тот проект — назови его сам: `plan_init(..., plane_project="fers")`; постоянное соответствие — строкой в таблице.
+
 Схемы инструментов грузи одним вызовом:
 `ToolSearch("select:mcp__planner__plan_scout,mcp__planner__plan_init,mcp__planner__plan_run,mcp__planner__plan_verify,mcp__planner__plan_update,mcp__planner__plan_show,mcp__planner__plan_review,mcp__planner__wiki_publish,mcp__planner__plan_finish")`.
 Реже нужны `plan_jobs`, `plan_worker`, `plan_skip`, `wiki_pages` — догружай по месту.

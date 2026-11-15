@@ -9,6 +9,9 @@
   prompt    UserPromptSubmit            — новый ход пользователя: сбросить счётчики
   stop      Stop                        — не бросать план, который вели в этом ходу
 
+Сессия вне Agent Hub, которая ведёт план с задачей Plane, видна на доске хаба: track запоминает, какая
+сессия ведёт план, prompt и stop сообщают раннеру этого хоста «агент работает» / «агент остановился».
+
 Любая внутренняя ошибка — fail-open: хук молчит и ничего не блокирует.
 """
 from __future__ import annotations
@@ -17,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -327,6 +331,7 @@ def track(data: dict) -> dict:
             plan = read_plan(root)
             if tool.rsplit("__", 1)[-1] in OWNER_TOOLS and not refused(data) and plan and plan.get("status") != "finished":
                 st.setdefault("plans", {})[root] = plan.get("created_at")
+                remember_owner(root, plan, data)
         st["turn"] = True
         st["ts"] = time.time()
         save_state(sid, st)
@@ -353,18 +358,60 @@ def track(data: dict) -> dict:
     return out
 
 
+def remember_owner(root: str, plan: dict, data: dict) -> None:
+    """Какая сессия ведёт план папки: по этой записи планер подписывает события для доски Agent Hub."""
+    path = os.path.join(os.path.expanduser("~/.cache/claude-planner/owners"),
+                        hashlib.sha1(os.path.realpath(root).encode()).hexdigest()[:16] + ".json")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"plan": plan.get("created_at"), "session_id": data.get("session_id") or "",
+                       "transcript_path": data.get("transcript_path") or ""}, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def hub_phase(st: dict, phase: str) -> None:
+    """Сессия вне Agent Hub: сказать доске, что агент снова работает или остановился.
+
+    Событие собирает и шлёт отдельный процесс (cli hub-phase): хук пакет не импортирует и не ждёт."""
+    if os.environ.get("HUB2_TASK") or not os.path.isfile(os.path.expanduser("~/.hub2/config.json")):
+        return  # сессию хаба ведёт сам раннер; без раннера на хосте сообщать некому
+    for root, stamp in (st.get("plans") or {}).items():
+        plan = read_plan(root)
+        if not plan or plan.get("created_at") != stamp or plan.get("status") == "finished" \
+                or not (plan.get("plane") or {}).get("issue_id"):
+            continue
+        try:
+            subprocess.Popen([sys.executable, os.path.join(SELF, "planner", "cli.py"), "hub-phase", root, phase],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except OSError:
+            pass
+
+
 def prompt(data: dict) -> dict:
     sid = data.get("session_id") or ""
     st = load_state(sid)
     if st:
         st.update(turn=False, blocks=0, block_hash="")
         save_state(sid, st)
+        hub_phase(st, "busy")
     return {}
 
 
 # ───────────────────────── stop ─────────────────────────
 
 def stop(data: dict) -> dict:
+    out = hold_plan(data)
+    if not out and not data.get("agent_id"):  # ход действительно закончился — агент ждёт пользователя
+        hub_phase(load_state(data.get("session_id") or ""), "idle")
+    return out
+
+
+def hold_plan(data: dict) -> dict:
     sid = data.get("session_id") or ""
     st = load_state(sid)
     if not st.get("turn") or not st.get("plans"):
