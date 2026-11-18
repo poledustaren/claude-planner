@@ -291,7 +291,10 @@ def plan_gate(data: dict) -> dict:
                   "основная сессия: остановись и верни ей отчёт — что и в каких файлах нужно изменить (file:line).")
     else:
         reason = (f"{name}: правка без плана. В проекте правки идут только по плану — это решает хук, а не размер "
-                  f"задачи. Заведи план: скилл planner → plan_init(project_dir=\"{root}\", title, goal, items). Вес "
+                  f"задачи. Заведи план: скилл planner → plan_init(project_dir=\"{root}\", title, goal, items). "
+                  + ("" if os.environ.get("HUB2_DEPLOY") in ("master", "test") else
+                     "Перед plan_init спроси пользователя, куда деплоим: в мастер или для теста. ")
+                  + "Вес "
                   "выбираешь ты и меняешь по ходу: мелочь в одном файле, отладка, эксперимент, не код — пункт без проверки "
                   "{title, light: trivial|debug|spike|nocode|followup}, закрывается plan_verify(note); работа с "
                   "наблюдаемым результатом — пункт tier \"main\" с verify, делаешь сам; работы "

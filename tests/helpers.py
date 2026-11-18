@@ -31,8 +31,9 @@ class ProjectCase(unittest.TestCase):
         self.write("b.py", "def b():\n    return 2\n")
         subprocess.run("git add -A && git -c user.email=t@t -c user.name=t commit -qm init", shell=True,
                        cwd=self.dir, check=True)
-        self._env = {k: os.environ.get(k) for k in ("CPLAN_CLAUDE_BIN", "HOME")}
+        self._env = {k: os.environ.get(k) for k in ("CPLAN_CLAUDE_BIN", "HOME", "HUB2_DEPLOY")}
         os.environ["CPLAN_CLAUDE_BIN"] = FAKE
+        os.environ["HUB2_DEPLOY"] = "master"  # планы с проверками требуют ответ «куда деплоим»
         self.home = tempfile.mkdtemp(prefix="cplan-home-")
         os.environ["HOME"] = self.home  # конфиги, кэш хуков и сессии — в песочнице
         plane.FACTORY = lambda: None

@@ -86,6 +86,16 @@ class HubEvents(ProjectCase):
         self.assertEqual((self.last()["status"], self.last()["done"]), ("finished", 2))
         self.assertEqual(self.last()["details"]["summary"], "оба пункта закрыты, файл проверен")
 
+    def test_finish_event_carries_report(self):
+        flow.init(self.dir, "План хаба", "файл out.txt создан и проверен", [item()])
+        self.write("out.txt", "ok")
+        flow.run(self.dir, wait=False)
+        flow.verify(self.dir)
+        flow.finish(self.dir, "файл создан и проверен")
+        report = self.last()["details"]["report"]
+        self.assertRegex(report, r"^reports/.+\.html$")
+        self.assertTrue(os.path.isfile(core.pdir(self.dir, report)))
+
     def test_details_carry_process_structure(self):
         flow.init(self.dir, "План хаба", "файл out.txt создан и проверен",
                   [item(files=["new:out.txt"]),

@@ -19,6 +19,11 @@ from planner import core, flow  # noqa: E402
 VERSION = "1.4.0"
 DIRP = {"type": "string", "description": "Абсолютный путь к папке проекта"}
 IDS = {"type": "array", "items": {"type": "string"}}
+DEPLOY_PROPS = {
+    "deploy": {"type": "string", "enum": list(core.DEPLOY),
+               "description": "Куда деплоим результат: master — в мастер, test — для теста. Спроси пользователя до plan_init"},
+    "deploy_quote": {"type": "string", "description": "Ответ пользователя про деплой дословно"},
+}
 ITEM = {
     "type": "object", "required": ["title"],
     "properties": {
@@ -68,7 +73,8 @@ TOOLS = [
           "deploy_rules": {"type": "string", "description": "Паспорт: деплой и проверка"},
           "links": {"type": "string", "description": "Паспорт: репозиторий, стенды"},
           "plane_project": {"type": "string", "description": "Проект Plane (имя или идентификатор), если правило "
-                            "по папке выбрало бы не тот; обычно не нужен"}},
+                            "по папке выбрало бы не тот; обычно не нужен"},
+          **DEPLOY_PROPS},
          ["project_dir", "title", "goal", "items"]),
     tool("plan_update", "Изменить план: add — новые пункты (в т.ч. доработка после приёмки); update — правка "
          "полей пункта по id (reopen:true переоткрывает закрытый); title, goal — название и цель; remove — "
@@ -80,7 +86,8 @@ TOOLS = [
           "hold": {"type": "string"},
           "branch": {"type": "string", "description": "Перенести план в текущую ветку git"},
           "title": {"type": "string"}, "goal": {"type": "string"},
-          "remove": IDS, "user_approval": {"type": "string", "description": "Цитата согласия пользователя (для remove)"}},
+          "remove": IDS, "user_approval": {"type": "string", "description": "Цитата согласия пользователя (для remove)"},
+          **DEPLOY_PROPS},
          ["project_dir"]),
     tool("plan_run", "Двигать план: стартует все готовые пункты (воркеры Sonnet параллельно, до 4; main — помечает "
          "тебе) и при wait ждёт первого завершившегося воркера. Надзиратель сам прогоняет проверки пункта и при "
@@ -104,7 +111,7 @@ TOOLS = [
     tool("plan_verify", "Прогнать проверки пунктов, которые делал ты сам (main) или которые упали. Единственный "
          "путь пункта в done; пункты воркеров проверяет надзиратель.",
          {"project_dir": DIRP, "item_ids": IDS,
-          "note": {"type": "string", "description": "Для light: что сделал"}}, ["project_dir"]),
+          "note": {"type": "string", "description": "Что сделал и зачем — попадёт в отчёт; для light обязателен"}}, ["project_dir"]),
     tool("plan_skip", "Закрыть пункты без проверки, только с дословной цитатой согласия пользователя: "
          "outcome=skipped — не делаем; done — результат принят как есть (проверка устарела, сделано иначе).",
          {"project_dir": DIRP, "item_id": {"type": "string"}, "item_ids": IDS, "reason": {"type": "string"},
@@ -165,10 +172,11 @@ def dispatch(name: str, a: dict, progress) -> str:
     if name == "plan_init":
         return flow.init(d, a.get("title"), a.get("goal"), a.get("items"), a.get("review", "auto"), "auto",
                          {k: a.get(k) for k in ("stack", "features", "deploy_rules", "links", "plane_project")},
-                         a.get("docs", "auto"))
+                         a.get("docs", "auto"), a.get("deploy"), a.get("deploy_quote"))
     if name == "plan_update":
         return flow.update(d, a.get("add"), a.get("update"), a.get("hold"), a.get("title"), a.get("goal"),
-                           a.get("remove"), a.get("user_approval"), a.get("branch"))
+                           a.get("remove"), a.get("user_approval"), a.get("branch"), a.get("deploy"),
+                           a.get("deploy_quote"))
     if name == "plan_run":
         return flow.run(d, a.get("item_ids"), a.get("wait"), int(a.get("timeout", 600)), bool(a.get("fresh")), progress)
     if name == "plan_jobs":

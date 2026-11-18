@@ -428,7 +428,8 @@ def assignee_id(cl: Client, root: str, meta: dict) -> str:
 
 def issue_html(plan: dict, meta: dict, page_url: str = "") -> str:
     esc = html.escape
-    parts = [f"<h3>Цель задачи</h3><p>{esc(plan['goal'])}</p>", "<h3>Контекст проекта</h3><ul>",
+    parts = [f"<h3>Цель задачи</h3><p>{esc(plan['goal'])}</p>",
+             *[f"<p><strong>{esc(line)}</strong></p>" for line in core.deploy_lines(plan)], "<h3>Контекст проекта</h3><ul>",
              f"<li><strong>Папка проекта:</strong> <code>{esc(plan['root'])}</code></li>",
              f"<li><strong>Стек:</strong> {esc(str(meta.get('stack') or '—'))}</li>",
              f"<li><strong>Деплой / проверка:</strong> {esc(str(meta.get('deploy_rules') or '—'))}</li>"]

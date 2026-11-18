@@ -116,6 +116,10 @@ def _details(snap: dict) -> dict:
         out["planDir"] = core.pdir(snap["root"])  # хаб показывает файлы плана во вкладке «Артефакты»
     if snap.get("summary"):
         out["summary"] = snap["summary"]
+    if snap.get("deploy"):
+        out["deploy"] = snap["deploy"]
+    if snap.get("report"):
+        out["report"] = snap["report"]
     items = []
     for i in (snap.get("items") or [])[:60]:
         one = {"id": i.get("id") or "", "title": i.get("title") or "", "status": i.get("status") or "",

@@ -18,6 +18,8 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
+from . import report
+
 DIR = ".cplan"
 CLOSED = ("done", "skipped")
 OPEN = ("todo", "in_progress", "failed")
@@ -499,7 +501,7 @@ def git_head(root: str) -> str:
 
 
 def init(root: str, title: str, goal: str, items, review="auto", track="auto", refine: bool = False,
-         docs="auto") -> dict:
+         docs="auto", deploy=None, deploy_quote=None) -> dict:
     if not isinstance(title, str) or len(title.strip()) < 3:
         raise PlanError("title обязателен.")
     if not isinstance(goal, str) or len(goal.strip()) < 10:
@@ -517,19 +519,48 @@ def init(root: str, title: str, goal: str, items, review="auto", track="auto", r
                             "Дополни или перестрой его plan_update(add / update / remove / title / goal) либо закрой "
                             "plan_finish. План устарел — спроси пользователя и закрой как есть: "
                             "plan_finish(summary, user_approval=<цитата>, force=true).")
+        try:
+            base_snap = report.snapshot(root)
+        except Exception:  # noqa: BLE001 — снимок для отчёта не должен ронять plan_init
+            base_snap = {}
+        plan = {"version": 1, "root": root, "project": os.path.basename(root), "title": title.strip(),
+                "goal": goal.strip(), "status": "active", "created_at": now(), "base_rev": git_head(root),
+                "branch": git_branch(root), "base_snap": base_snap,
+                "review_mode": review, "track": track, "docs": {"mode": docs, "published": []},
+                "items": [], "history": []}
+        _append_items(plan, items, root)
+        found = resolve_deploy(deploy, deploy_quote, None, any(not i.get("light") for i in plan["items"]))
+        if found:
+            plan["deploy"] = found
+        # Архив — когда новый план уже собран: отказ (нет ответа о деплое, негодный пункт) не плодит копии старого.
         if old:
             stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             atomic_write(pdir(root, "archive", f"{stamp}-{slugify(old['title'])}.json"),
                          json.dumps(old, ensure_ascii=False, indent=1))
-        plan = {"version": 1, "root": root, "project": os.path.basename(root), "title": title.strip(),
-                "goal": goal.strip(), "status": "active", "created_at": now(), "base_rev": git_head(root),
-                "branch": git_branch(root),
-                "review_mode": review, "track": track, "docs": {"mode": docs, "published": []},
-                "items": [], "history": []}
-        _append_items(plan, items, root)
         event(plan, "init")
         save(root, plan)
     return plan
+
+
+DEPLOY = {"master": "в мастер", "test": "для теста"}
+DEPLOY_ASK = ("Не сказано, куда деплоим. Спроси пользователя сейчас одним вопросом: «Куда деплоим — в мастер или для "
+              "теста?» — и повтори вызов с deploy=\"master\" или \"test\" и deploy_quote — его ответом дословно.")
+
+
+def resolve_deploy(deploy, deploy_quote, current, needed: bool) -> dict | None:
+    """Новое значение plan["deploy"] или None, если менять не нужно. needed — правка добавила проверяемые пункты."""
+    if deploy not in (None, ""):
+        if deploy not in DEPLOY:
+            raise PlanError("deploy: допустимо \"master\" (в мастер) или \"test\" (для теста).")
+        if not isinstance(deploy_quote, str) or len(deploy_quote.strip()) < 2:
+            raise PlanError("deploy_quote: приведи ответ пользователя дословно")
+        return {"target": deploy, "quote": deploy_quote.strip()[:300], "source": "user"}
+    if current or not needed:
+        return None
+    env = os.environ.get("HUB2_DEPLOY")
+    if env in DEPLOY:
+        return {"target": env, "quote": "выбрано при постановке задачи в Agent Hub", "source": "hub"}
+    raise PlanError(DEPLOY_ASK)
 
 
 def approval_quote(user_approval, what: str) -> str:
@@ -540,8 +571,9 @@ def approval_quote(user_approval, what: str) -> str:
 
 
 def update(root: str, add=None, changes=None, hold=None, title=None, goal=None, remove=None,
-           user_approval=None, branch=None) -> dict:
-    if not add and not changes and not remove and hold is None and title is None and goal is None and branch is None:
+           user_approval=None, branch=None, deploy=None, deploy_quote=None) -> dict:
+    if (not add and not changes and not remove and hold is None and title is None and goal is None and branch is None
+            and deploy in (None, "")):
         raise PlanError("Нечего менять: передай add (новые пункты), update (правки пунктов), remove (удалить "
                         "пункты), title, goal или hold.")
     if title is not None and (not isinstance(title, str) or len(title.strip()) < 3):
@@ -553,6 +585,7 @@ def update(root: str, add=None, changes=None, hold=None, title=None, goal=None, 
     approval = approval_quote(user_approval, "Удалить пункты из плана") if remove else ""
     with locked(root):
         plan = load(root)
+        had_checked = any(not i.get("light") for i in plan["items"])
         if plan.get("status") == "finished":
             plan["status"] = "active"
             plan.pop("finished_at", None)
@@ -605,6 +638,11 @@ def update(root: str, add=None, changes=None, hold=None, title=None, goal=None, 
             for it in _append_items(plan, add, root):
                 event(plan, "add", it["id"])
         compute_waves(plan["items"])
+        found = resolve_deploy(deploy, deploy_quote, plan.get("deploy"),
+                               not had_checked and any(not i.get("light") for i in plan["items"]))
+        if found:
+            plan["deploy"] = found
+            event(plan, "deploy", note=f"{found['target']} | {found['quote']}")
         if hold is not None:
             plan["hold"] = str(hold).strip()[:300] or None
             event(plan, "hold", note=plan["hold"] or "снят")
@@ -841,6 +879,8 @@ def verify_items(root: str, item_ids: list, by: str = "main", recheck: bool = Fa
             if ev["passed"]:
                 if was != "done":
                     it["closed_at"] = now()
+                if isinstance(note, str) and note.strip() and not recheck:
+                    it["done_note"] = note.strip()[:2000]
                 it.pop("note", None)
                 it.pop("manual", None)
             else:
@@ -933,6 +973,53 @@ def finish(root: str, summary: str, user_approval: str | None = None, force: boo
     return plan
 
 
+def report_data(root: str, plan: dict, worker_notes: dict | None = None) -> dict:
+    """Данные для report.render: пункты плана плоским списком, дифф файлов относительно plan_init."""
+    items = []
+    for it in plan["items"]:
+        ev = it["evidence"][-1] if it.get("evidence") else {}
+        items.append({"id": it["id"], "title": it["title"], "status": it["status"], "acceptance": it.get("acceptance") or "",
+                      "note": it.get("done_note") or (worker_notes or {}).get(it["id"]) or "",
+                      "light": it.get("light"), "files": it.get("files") or [],
+                      "checks": [{"cmd": c.get("what") or "", "ok": bool(c.get("passed"))}
+                                 for c in ev.get("checks") or []]})
+    files = report.git_files(root, plan.get("base_snap") or {"rev": plan.get("base_rev") or ""})
+    by_item, other = report.attribute(files, items)
+    for it in items:
+        it["files"] = by_item.get(it["id"], [])
+    info = plan.get("plane") or {}
+    rounds = review_rounds(plan)
+    data = {"title": plan["title"], "goal": plan["goal"], "summary": plan.get("summary") or "",
+            "project": plan.get("project") or os.path.basename(root), "branch": plan.get("branch") or "",
+            "deploy": plan.get("deploy") or {}, "created": plan.get("created_at"), "finished": plan.get("finished_at"),
+            "plane": {"key": info.get("issue_key"), "url": info.get("issue_url")},
+            "items": items, "other_files": other,
+            "docs": [{"title": p.get("title"), "url": p.get("url")} for p in docs_published(plan)]}
+    if rounds:
+        last = rounds[-1]
+        data["review"] = {"verdict": last["verdict"],
+                          "issues": [f"{i.get('file', '')}:{i.get('line', '')} {i['problem']}".strip(": ")
+                                     for i in last.get("issues", [])]}
+    return data
+
+
+def write_report(root: str, worker_notes: dict | None = None) -> str:
+    """Пишет HTML-отчёт закрытого плана и запоминает путь в plan['report']. Сбой — строка с причиной."""
+    plan = load(root)
+    try:
+        path = report.write(pdir(root), report_data(root, plan, worker_notes))
+    except Exception as exc:  # noqa: BLE001 — отчёт не должен мешать закрытию плана
+        reason = " ".join(f"{type(exc).__name__}: {exc}".split())[:200]
+        with mutate(root) as plan:
+            event(plan, "report_failed", note=reason)
+        return f"отчёт не собран: {reason}"
+    rel = os.path.relpath(path, pdir(root))
+    with mutate(root) as plan:
+        plan["report"] = rel.replace(os.sep, "/")
+        event(plan, "report", note=plan["report"])
+    return ""
+
+
 # ───────────────────────── представление ─────────────────────────
 
 def counts(plan: dict) -> str:
@@ -953,9 +1040,16 @@ def status_line(plan: dict) -> str:
     return f"«{plan['title']}» — {plan['status']} ({counts(plan)}){extra}{hold}" + (f" | {key}" if key else "")
 
 
+def deploy_lines(plan: dict) -> list[str]:
+    target = (plan.get("deploy") or {}).get("target")
+    return [f"Деплой: {DEPLOY[target]}"] if target in DEPLOY else []
+
+
 def render(plan: dict) -> str:
     waves = compute_waves(plan["items"]) if plan["items"] else {}
-    lines = [f"# {plan['title']}", "", f"Цель: {plan['goal']}", f"Статус: {status_line(plan)}", ""]
+    lines = [f"# {plan['title']}", "", f"Цель: {plan['goal']}", *deploy_lines(plan), f"Статус: {status_line(plan)}", ""]
+    if plan.get("report"):
+        lines[-1:-1] = [f"Отчёт: {pdir(plan['root'], plan['report'])}"]
     for it in plan["items"]:
         deps = f" ← {','.join(it['depends_on'])}" if it["depends_on"] else ""
         tail = ""

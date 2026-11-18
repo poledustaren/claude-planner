@@ -209,6 +209,10 @@ def item_prompt(plan: dict, item: dict) -> str:
         for c in item["verify"]))
     if plan.get("branch"):
         parts.append(f"ВЕТКА: {plan['branch']} — не переключай и не создавай другие.")
+    target = (plan.get("deploy") or {}).get("target")
+    if target:
+        parts.append("Деплой: для теста — в master/main не сливать и не пушить." if target == "test"
+                     else "Деплой: в мастер.")
     from . import graph
     users = graph.links(root, core.file_paths(item))
     if users:

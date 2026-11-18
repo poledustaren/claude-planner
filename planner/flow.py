@@ -76,11 +76,12 @@ def _tail(root: str, extra: str = "") -> str:
 # ───────────────────────── план ─────────────────────────
 
 def init(project_dir: str, title: str, goal: str, items, review="auto", track="auto", passport: dict | None = None,
-         docs="auto") -> str:
+         docs="auto", deploy=None, deploy_quote=None) -> str:
     root = core.project_root(project_dir)
     if any(j["kind"] != "scout" for j in workers.active_jobs(root)):
         raise core.PlanError("В проекте ещё работают воркеры прошлого плана: plan_jobs(wait=true, mode=\"all\").")
-    plan = core.init(root, title, goal, items, review=review, track=track, docs=docs)
+    plan = core.init(root, title, goal, items, review=review, track=track, docs=docs, deploy=deploy,
+                     deploy_quote=deploy_quote)
     _prune(root)
     notes = core.advice(plan)
     sync = plane.sync(root, passport)
@@ -102,10 +103,10 @@ def _prune(root: str) -> None:
 
 
 def update(project_dir: str, add=None, changes=None, hold=None, title=None, goal=None, remove=None,
-           user_approval=None, branch=None) -> str:
+           user_approval=None, branch=None, deploy=None, deploy_quote=None) -> str:
     root = core.project_root(project_dir)
     plan = core.update(root, add=add, changes=changes, hold=hold, title=title, goal=goal, remove=remove,
-                       user_approval=user_approval, branch=branch)
+                       user_approval=user_approval, branch=branch, deploy=deploy, deploy_quote=deploy_quote)
     notes = [f"Замечание: {n}" for n in core.advice(plan)] if add or changes or remove else []
     return _tail(root, "\n".join(["План обновлён.", *notes, plane.sync(root)]).strip())
 
@@ -636,6 +637,7 @@ def snapshot(project_dir: str) -> dict | None:
             "goal": plan.get("goal") or "", "updatedAt": plan.get("updated_at") or "",
             "done": done, "total": len(plan["items"]), "hold": plan.get("hold") or "",
             "issue": (plan.get("plane") or {}).get("issue_key") or "",
+            "deploy": (plan.get("deploy") or {}).get("target") or "",
             "isActive": plan["status"] != "finished" or any(j["status"] in workers.ACTIVE for j in jobs),
             "items": [{"id": i["id"], "title": i["title"], "tier": i["tier"], "status": i["status"],
                        "wave": waves.get(i["id"], 0), "acceptance": i.get("acceptance") or "",
@@ -651,6 +653,8 @@ def snapshot(project_dir: str) -> dict | None:
             "scouts": scouts, "next": next_hint(root, plan)}
     if plan["status"] == "finished" and plan.get("summary"):
         snap["summary"] = plan["summary"]
+    if plan.get("report"):
+        snap["report"] = plan["report"]
     return snap
 
 
@@ -664,8 +668,17 @@ def finish(project_dir: str, summary: str, user_approval: str | None = None, for
     elif live:
         raise core.PlanError(f"Ещё работают воркеры ({len(live)}). Дождись plan_jobs(wait=true, mode=\"all\") или останови.")
     plan = core.finish(root, summary, user_approval, force)
+    jobs = workers.list_jobs(root)
+    notes = {}
+    for j in jobs:
+        if j.get("kind") == "item" and j.get("item_id"):
+            text = (workers.view(j)["report"] or "").strip()
+            if text:
+                notes[str(j["item_id"])] = text if len(text) <= 2500 else text[:2500].rstrip() + "…"
+    failed = core.write_report(root, notes)
+    plan = core.load(root)
     hub.notify(plan, snapshot(root) if hub.target(plan) else None)
-    for job in workers.list_jobs(root):
+    for job in jobs:
         workers.cleanup_session(job)
     cost = sum(workers.view(j)["cost"] for j in workers.list_jobs(root))
     how = ("Закрыт как есть решением пользователя, проверки не гонялись." if force else
@@ -674,5 +687,11 @@ def finish(project_dir: str, summary: str, user_approval: str | None = None, for
            + (" Гейты сняты решением пользователя: " + "; ".join(plan["user_override"]["gates"]) + "."
               if plan.get("user_override") else ""))
     lines = [f"План «{plan['title']}» закрыт: {core.counts(plan)}. {how} Воркеры за план: ${round(cost, 3)}.",
+             f"Отчёт: {core.pdir(root, plan['report'])} — дай пользователю ссылку на этот файл" if plan.get("report")
+             else failed,
              plane.sync(root)]
+    target = (plan.get("deploy") or {}).get("target")
+    if target:
+        lines.append("Деплой: в мастер — предложи пользователю слить и выкатить." if target == "master" else
+                     "Деплой: для теста — в мастер не сливать, выкатывать на тестовый стенд.")
     return "\n".join(x for x in lines if x)
