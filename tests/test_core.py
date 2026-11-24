@@ -138,6 +138,79 @@ class Lifecycle(ProjectCase):
         self.assertTrue(os.path.isfile(core.pdir(self.dir, ".gitignore")))
 
 
+class RecheckReuse(ProjectCase):
+    """Приёмка и финиш не перезапускают зелёные локальные проверки, если дерево не менялось."""
+
+    def setUp(self):
+        super().setUp()
+        self.counter = os.path.join(self.home, "runs")
+        # проверка сама пишет «скриншот» со случайным содержимым — как e2e-тесты
+        self.cmd = f"printf x >> {self.counter} && head -c 16 /dev/urandom > shot.bin && test -f out.txt"
+
+    def runs(self):
+        with open(self.counter, encoding="utf-8") as fh:
+            return len(fh.read())
+
+    def start(self, verify=None, items=None):
+        core.init(self.dir, "План", "цель плана достаточно длинная", items or [item(verify=verify or [self.cmd])])
+        self.write("out.txt", "x")
+        core.verify_items(self.dir, ["1"])
+
+    def recheck(self):
+        return core.verify_items(self.dir, ["1"], by="finish", recheck=True)[0][1]
+
+    def test_same_tree_is_not_rerun(self):
+        self.start()
+        ev = self.recheck()
+        self.assertEqual(self.runs(), 1)
+        self.assertTrue(ev["passed"] and ev["checks"][0].get("reused"))
+        self.assertIn("без перезапуска", self.plan()["history"][-1]["note"])
+        core.finish(self.dir, "итог работы по плану")
+        self.assertEqual(self.runs(), 1)
+
+    def test_changed_tree_reruns_then_reuses(self):
+        self.start()
+        self.write("a.py", "def a():\n    return 3\n")  # отслеживаемый файл
+        self.recheck()
+        self.assertEqual(self.runs(), 2)
+        self.write("new.py", "x = 1\n")  # неотслеживаемый файл
+        self.recheck()
+        self.assertEqual(self.runs(), 3)
+        self.recheck()  # после прогона дерево не менялось
+        self.assertEqual(self.runs(), 3)
+
+    def test_regression_after_change_is_caught(self):
+        self.start()
+        os.remove(os.path.join(self.dir, "out.txt"))
+        self.assertFalse(self.recheck()["passed"])
+        self.write("out.txt", "x")
+        self.assertTrue(self.recheck()["passed"])  # упавшая проверка забыта — прогон настоящий
+        self.assertEqual(self.runs(), 3)
+
+    def test_fresh_and_expired_are_rerun(self):
+        self.start(verify=[{"type": "cmd", "cmd": self.cmd, "fresh": True}])
+        self.recheck()
+        self.assertEqual(self.runs(), 2)
+        self.tearDown()
+        self.setUp()
+        self.start()
+        ttl, core.REUSE_TTL = core.REUSE_TTL, 0
+        try:
+            self.recheck()
+        finally:
+            core.REUSE_TTL = ttl
+        self.assertEqual(self.runs(), 2)
+
+    def test_busy_worker_blocks_remembering(self):
+        core.init(self.dir, "План", "цель плана достаточно длинная", [item(verify=[self.cmd]), item(verify=["test -f b.py"])])
+        self.write("out.txt", "x")
+        core.set_status(self.dir, "2", "in_progress", job="job-2")
+        core.verify_items(self.dir, ["1"])
+        self.assertEqual(self.plan().get("check_ok", {}), {})
+        self.recheck()
+        self.assertEqual(self.runs(), 2)
+
+
 class ChangedCircumstances(ProjectCase):
     """Выходы из клинча: всё, что снимает гейт, требует цитаты согласия пользователя."""
 

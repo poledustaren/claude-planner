@@ -9,11 +9,13 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 import re
 import signal
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +37,8 @@ DEFAULT_TIMEOUT = 300
 MAX_TIMEOUT = 3600
 HTTP_TIMEOUT = 20
 TAIL = 1500
+REUSE_TTL = 6 * 3600    # сек: столько живёт зелёная проверка на неизменном дереве — recheck её не перезапускает
+REUSABLE = ("cmd", "file_exists", "file_contains")  # node и http смотрят наружу — их гоняем всегда
 LIGHT = {"debug": "отладка", "spike": "эксперимент", "nocode": "не код", "trivial": "мелкая правка",
          "followup": "доделка"}  # пункты без проверки: закрываются записью «что сделал», а не прогоном verify
 BOX = {"done": "[x]", "todo": "[ ]", "in_progress": "[~]", "failed": "[!]", "skipped": "[-]"}
@@ -275,6 +279,8 @@ def normalize_check(c, where: str) -> dict:
         if is_trivial_cmd(cmd):
             raise PlanError(f"{where}: команда {cmd!r} ничего не доказывает (true, echo, ls, exit 0, «|| true»). "
                             "Нужна реальная проверка: тесты, сборка, rg -q по результату, curl -fsS.")
+        if c.get("fresh"):  # команда смотрит наружу (стенд, БД) — recheck гоняет её всегда
+            extra["fresh"] = True
         return {"type": "cmd", "cmd": cmd.strip(),
                 "timeout": _int(c.get("timeout"), DEFAULT_TIMEOUT, where, "timeout", 1, MAX_TIMEOUT),
                 "expect_exit": _int(c.get("expect_exit"), 0, where, "expect_exit"), **extra}
@@ -806,17 +812,57 @@ def check_label(c: dict) -> str:
     return str(c.get("cmd") or c.get("url") or c.get("path") or ", ".join(c.get("paths", [])))[:160]
 
 
-def _run_checks(root: str, checks: list, cache: dict | None = None) -> tuple[bool, list, str]:
+def check_key(c: dict) -> str:
+    return json.dumps(c, sort_keys=True, ensure_ascii=False)
+
+
+def tree_fingerprint(root: str) -> str | None:
+    """Отпечаток рабочего дерева git: HEAD, правки отслеживаемых файлов и содержимое неотслеживаемых (без .cplan
+    и игнорируемых). Отпечаток тот же — исходники те же. None — не git или git не ответил: повторов тогда нет."""
+    spec = ["--", ":(top)", ":(top,exclude,glob)**/.cplan/**"]
+    try:
+        runs = [subprocess.run(["git", "-C", root, *args], capture_output=True, timeout=120)
+                for args in (["rev-parse", "HEAD"], ["diff", "HEAD", "--binary", "--no-ext-diff", "--no-textconv", *spec],
+                             ["ls-files", "-z", "-o", "--exclude-standard", *spec])]
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if any(r.returncode for r in runs):
+        return None
+    h = hashlib.sha256(runs[0].stdout + b"\0" + runs[1].stdout)
+    for rel in sorted(p for p in runs[2].stdout.split(b"\0") if p):
+        h.update(b"\0" + rel + b"\0")
+        path = os.path.join(root, os.fsdecode(rel))
+        try:
+            if os.path.islink(path):
+                h.update(os.fsencode(os.readlink(path)))
+            else:
+                with open(path, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(chunk)
+        except OSError:
+            h.update(b"?")
+    return h.hexdigest()
+
+
+def _run_checks(root: str, checks: list, cache: dict | None = None,
+                reuse: dict | None = None) -> tuple[bool, list, str]:
+    """reuse — зелёные результаты на текущем отпечатке дерева {ключ проверки: запись}: эти проверки не запускаются."""
     results, log = [], []
     for c in checks:
-        key = json.dumps(c, sort_keys=True, ensure_ascii=False)
+        key = check_key(c)
         if cache is not None and key in cache:
             ok, detail, out = cache[key]
+        elif reuse and key in reuse:
+            rec = reuse[key]
+            ok, detail = True, f"без перезапуска: дерево не менялось с {rec['ts'][:19]}"
+            out = f"[прошла {rec['ts']} на том же дереве, лог {rec.get('log') or '—'}; повторно не запускалась]"
         else:
             ok, detail, out = run_check(root, c)
             if cache is not None:
                 cache[key] = (ok, detail, out)
         res = {"type": c["type"], "what": check_label(c), "passed": ok, "detail": detail}
+        if reuse and key in reuse:
+            res["reused"] = True
         if not ok:
             res["tail"] = out[-TAIL:]
         results.append(res)
@@ -848,11 +894,19 @@ def verify_items(root: str, item_ids: list, by: str = "main", recheck: bool = Fa
         if light and (not isinstance(note, str) or len(note.strip()) < 10):
             raise PlanError(f"Пункты без проверки ({', '.join(light)}) закрываются записью: plan_verify(item_ids=[...], "
                             "note=\"что сделал и чем убедился\") — не короче 10 символов.")
+        # Воркер правит дерево прямо во время прогона — зелёный результат нельзя привязать к отпечатку.
+        busy = any(i["status"] == "in_progress" and i.get("job") and i["id"] not in {str(x) for x in item_ids}
+                   for i in plan["items"])
+        saved = dict(plan.get("check_ok") or {})
     cache: dict = {} if recheck else None  # одинаковые проверки разных пунктов гоняем один раз
+    started, stamp = time.time(), now()
+    fp = tree_fingerprint(root) if recheck and saved else None
+    # recheck (приёмка, финиш): зелёное на том же дереве и не старше REUSE_TTL не перезапускаем
+    reuse = {k: r for k, r in saved.items() if fp and r.get("fp") == fp and started - r.get("at", 0) < REUSE_TTL}
 
     def one(target):
         iid, checks, n = target
-        ok, results, log = _run_checks(root, checks, cache)
+        ok, results, log = _run_checks(root, checks, cache, reuse)
         rel = os.path.join(DIR, "evidence", f"{iid}-{n}.log")
         atomic_write(os.path.join(root, rel), log)
         return iid, {"ts": now(), "passed": ok, "by": by, "log": rel, "checks": results}
@@ -860,8 +914,10 @@ def verify_items(root: str, item_ids: list, by: str = "main", recheck: bool = Fa
     workers = 1 if recheck else min(4, len(targets) or 1)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         done = list(pool.map(one, targets))
+    fp_end = tree_fingerprint(root) if targets and not busy else None  # выводы самих проверок (скриншоты) — уже в нём
     out = []
     with mutate(root) as plan:
+        remember_checks(plan, targets, done, fp_end, reuse, started, stamp)
         for iid in light:
             it = find(plan, iid)
             ev = {"ts": now(), "passed": True, "by": by, "log": None, "checks": [], "note": note.strip()[:500]}
@@ -886,9 +942,27 @@ def verify_items(root: str, item_ids: list, by: str = "main", recheck: bool = Fa
             else:
                 it.pop("closed_at", None)
             it["job"] = None if by == "main" else it.get("job")
-            event(plan, "verify_ok" if ev["passed"] else "verify_fail", iid, "" if ev["passed"] else fail_summary(ev))
+            event(plan, "verify_ok" if ev["passed"] else "verify_fail", iid, fail_summary(ev) if not ev["passed"] else
+                  "без перезапуска: дерево не менялось" if ev["checks"] and all(c.get("reused") for c in ev["checks"]) else "")
             out.append((dict(it), ev))
     return out
+
+
+def remember_checks(plan: dict, targets: list, done: list, fp: str | None, reuse: dict, started: float,
+                    stamp: str) -> None:
+    """Запоминает зелёные локальные проверки с отпечатком дерева после прогона; упавшие забывает.
+    Повторно взятые получают новый отпечаток, но прежний срок: иначе результат жил бы вечно."""
+    store = plan.setdefault("check_ok", {})
+    checks_of = {iid: checks for iid, checks, _ in targets}
+    for iid, ev in done:
+        for c, r in zip(checks_of[iid], ev["checks"]):
+            key = check_key(c)
+            if not r["passed"]:
+                store.pop(key, None)
+            elif fp and c["type"] in REUSABLE and not c.get("fresh"):
+                old = reuse.get(key) if r.get("reused") else None
+                store[key] = {"fp": fp, "at": old["at"] if old else started, "ts": old["ts"] if old else stamp,
+                              "log": old.get("log") if old else ev["log"]}
 
 
 def fail_summary(ev: dict) -> str:
