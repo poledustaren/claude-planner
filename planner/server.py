@@ -34,8 +34,8 @@ ITEM = {
                    "{type:file_contains,path,pattern} | "
                    "{type:file_exists,paths} | {type:http,url,expect_status?,contains?}", "items": {}},
         "tier": {"type": "string", "enum": list(core.TIERS),
-                 "description": "main — сам; code-mini — Haiku (механика, при провале сам уходит на code-low); code-low — "
-                                "Sonnet/low; code — Sonnet/medium (по умолчанию); code-high — Sonnet/high"},
+                 "description": "main — сам; code-mini — Haiku (механика); code-low — Sonnet/low (по умолчанию, "
+                                "при провале сам уходит на code); code — Sonnet/medium; code-high — Sonnet/high"},
         "files": {"type": "array", "items": {"type": "string"},
                   "description": "Пути от корня проекта, которые правит пункт; создаваемые — new:путь"},
         "depends_on": IDS,
@@ -242,6 +242,7 @@ def handle(msg: dict) -> None:
 
 
 def main() -> int:
+    flow.ASYNC_BG = True
     pending: list[threading.Thread] = []
     for line in sys.stdin:
         line = line.strip()
@@ -257,6 +258,7 @@ def main() -> int:
         pending += [t for t in threading.enumerate() if t not in before]
     for t in pending:  # stdin закрыт: дать вызовам дописать ответы
         t.join(timeout=30)
+    flow.flush_bg()
     return 0
 
 

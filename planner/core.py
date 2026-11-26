@@ -15,6 +15,7 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -26,7 +27,7 @@ DIR = ".cplan"
 CLOSED = ("done", "skipped")
 OPEN = ("todo", "in_progress", "failed")
 WORKER_TIERS = ("code-mini", "code-low", "code", "code-high")
-ESCALATE = {"code-mini": "code-low"}  # младшая модель не прошла проверки — пункт сам уходит ярусом выше
+ESCALATE = {"code-mini": "code-low", "code-low": "code"}  # младшая модель не прошла проверки — пункт сам уходит ярусом выше
 TIERS = ("main",) + WORKER_TIERS
 TIER_ALIASES = {"mini": "code-mini", "haiku": "code-mini", "low": "code-low", "mid": "code", "medium": "code", "high": "code-high",
                 "sonnet": "code", "self": "main", "orchestrator": "main"}
@@ -70,12 +71,15 @@ def project_root(project_dir: str) -> str:
     path = os.path.realpath(os.path.expanduser(project_dir.strip()))
     if not os.path.isdir(path):
         raise PlanError(f"Папки {path} нет. Укажи существующую папку проекта.")
-    try:
-        top = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"], capture_output=True,
-                             text=True, timeout=10).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        top = ""
-    root = os.path.realpath(top) if top else path
+    if os.path.exists(os.path.join(path, ".git")):
+        root = path
+    else:
+        try:
+            top = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"], capture_output=True,
+                                 text=True, timeout=10).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            top = ""
+        root = os.path.realpath(top) if top else path
     home = os.path.realpath(os.path.expanduser("~"))
     if root in ("/", "/tmp", home) or (root + os.sep).startswith(os.path.join(home, ".claude") + os.sep):
         raise PlanError(f"{root} — не проект (корень, /tmp, $HOME или конфиг агента). Укажи папку проекта.")
@@ -316,7 +320,7 @@ def normalize_check(c, where: str) -> dict:
 
 def normalize_tier(value, where: str) -> str:
     if value in (None, ""):
-        return "code"
+        return "code-low"
     tier = TIER_ALIASES.get(str(value).strip().lower(), str(value).strip().lower())
     if tier not in TIERS:
         raise PlanError(f"{where}: tier {value!r} не существует. Допустимо: {', '.join(TIERS)} "
@@ -452,15 +456,32 @@ def advice(plan: dict) -> list[str]:
     """Нежёсткие подсказки: что в плане выглядит дорого или хрупко."""
     notes = []
     items = plan["items"]
-    mains = [i for i in items if i["tier"] == "main"]
-    if len(items) >= REVIEW_MIN and len(mains) * 2 > len(items):
-        notes.append(f"{len(mains)} из {len(items)} пунктов на main: независимые пункты дешевле отдать "
-                     "code-low/code (Sonnet), себе оставь общие файлы и рискованное.")
+    checked_mains = [i for i in items if i["tier"] == "main" and not i.get("light")]
+    waves = compute_waves(items) if items else {}
+    if len(items) >= REVIEW_MIN and len(checked_mains) * 2 > len(items):
+        notes.append(f"{len(checked_mains)} из {len(items)} пунктов на main: независимые пункты дешевле отдать "
+                     "code-mini/code-low/code (Haiku/Sonnet), себе оставь общие файлы и рискованное.")
+    elif len(checked_mains) >= 2:
+        by_wave: dict[int, list] = {}
+        for m in checked_mains:
+            if file_paths(m):
+                by_wave.setdefault(waves.get(m["id"], 0), []).append(m)
+        for wave_items in by_wave.values():
+            if len(wave_items) >= 2:
+                sets = [set(file_paths(m)) for m in wave_items]
+                if not any(sets[a] & sets[b] for a in range(len(sets)) for b in range(a + 1, len(sets))):
+                    ids = ", ".join(m["id"] for m in wave_items)
+                    notes.append(f"Пункты main {ids} в одной волне правят разные файлы — их быстрее и дешевле "
+                                 "отдать параллельным воркерам (code-mini/code-low/code).")
+                    break
+    highs = [i["id"] for i in items if i["tier"] == "code-high" and i["status"] in OPEN]
+    if len(highs) >= 2:
+        notes.append(f"Сразу {len(highs)} пунктов на code-high ({', '.join(highs)}): code-high в ~15× дороже "
+                     "code-low. Для типовых задач ставь code-low — при провале планер сам повысит до code.")
     weak = [i["id"] for i in items if i["verify"] and all(c["type"] == "file_exists" for c in i["verify"])]
     if weak:
         notes.append(f"Пункты {', '.join(weak)} проверяются только наличием файла — это слабое доказательство.")
     todo = [i for i in items if i["status"] in OPEN]
-    waves = compute_waves(items) if items else {}
     crew = [i for i in todo if i["tier"] in WORKER_TIERS]
     if len(crew) >= 3 and len({waves[i["id"]] for i in crew}) == len(crew):
         notes.append(f"Все {len(crew)} пунктов воркеров идут строго по очереди. depends_on нужен только там, где "
@@ -844,18 +865,64 @@ def tree_fingerprint(root: str) -> str | None:
     return h.hexdigest()
 
 
-def _run_checks(root: str, checks: list, cache: dict | None = None,
+class _SharedCheckCache:
+    """Потокобезопасная дедупликация одинаковых проверок при параллельном recheck."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._done: dict[str, tuple[bool, str, str]] = {}
+        self._inflight: dict[str, threading.Event] = {}
+
+    def get_or_run(self, key: str, fn) -> tuple[bool, str, str]:
+        while True:
+            with self._lock:
+                if key in self._done:
+                    return self._done[key]
+                ev = self._inflight.get(key)
+                if ev is None:
+                    ev = threading.Event()
+                    self._inflight[key] = ev
+                    owner = True
+                else:
+                    owner = False
+            if owner:
+                try:
+                    res = fn()
+                    with self._lock:
+                        self._done[key] = res
+                    return res
+                finally:
+                    with self._lock:
+                        self._inflight.pop(key, None)
+                    ev.set()
+            ev.wait()
+
+
+def _job_editing(root: str, job_id: str) -> bool:
+    """True, если задание ещё правит дерево (QUEUED/RUNNING) или статус не читается (консервативно)."""
+    path = pdir(root, "jobs", str(job_id), "job.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            status = json.load(fh).get("status")
+    except (OSError, ValueError):
+        return True
+    return status in ("QUEUED", "RUNNING")
+
+
+def _run_checks(root: str, checks: list, cache: _SharedCheckCache | dict | None = None,
                 reuse: dict | None = None) -> tuple[bool, list, str]:
     """reuse — зелёные результаты на текущем отпечатке дерева {ключ проверки: запись}: эти проверки не запускаются."""
     results, log = [], []
     for c in checks:
         key = check_key(c)
-        if cache is not None and key in cache:
-            ok, detail, out = cache[key]
-        elif reuse and key in reuse:
+        if reuse and key in reuse:
             rec = reuse[key]
             ok, detail = True, f"без перезапуска: дерево не менялось с {rec['ts'][:19]}"
             out = f"[прошла {rec['ts']} на том же дереве, лог {rec.get('log') or '—'}; повторно не запускалась]"
+        elif isinstance(cache, _SharedCheckCache):
+            ok, detail, out = cache.get_or_run(key, lambda _c=c: run_check(root, _c))
+        elif cache is not None and key in cache:
+            ok, detail, out = cache[key]
         else:
             ok, detail, out = run_check(root, c)
             if cache is not None:
@@ -895,10 +962,12 @@ def verify_items(root: str, item_ids: list, by: str = "main", recheck: bool = Fa
             raise PlanError(f"Пункты без проверки ({', '.join(light)}) закрываются записью: plan_verify(item_ids=[...], "
                             "note=\"что сделал и чем убедился\") — не короче 10 символов.")
         # Воркер правит дерево прямо во время прогона — зелёный результат нельзя привязать к отпечатку.
-        busy = any(i["status"] == "in_progress" and i.get("job") and i["id"] not in {str(x) for x in item_ids}
+        self_ids = {str(x) for x in item_ids}
+        busy = any(i["status"] == "in_progress" and i.get("job") and i["id"] not in self_ids
+                   and _job_editing(root, i["job"])
                    for i in plan["items"])
         saved = dict(plan.get("check_ok") or {})
-    cache: dict = {} if recheck else None  # одинаковые проверки разных пунктов гоняем один раз
+    cache = _SharedCheckCache() if recheck else None  # одинаковые проверки разных пунктов гоняем один раз
     started, stamp = time.time(), now()
     fp = tree_fingerprint(root) if recheck and saved else None
     # recheck (приёмка, финиш): зелёное на том же дереве и не старше REUSE_TTL не перезапускаем
@@ -911,7 +980,7 @@ def verify_items(root: str, item_ids: list, by: str = "main", recheck: bool = Fa
         atomic_write(os.path.join(root, rel), log)
         return iid, {"ts": now(), "passed": ok, "by": by, "log": rel, "checks": results}
 
-    workers = 1 if recheck else min(4, len(targets) or 1)
+    workers = min(4, len(targets) or 1)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         done = list(pool.map(one, targets))
     fp_end = tree_fingerprint(root) if targets and not busy else None  # выводы самих проверок (скриншоты) — уже в нём

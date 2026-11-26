@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 
 from . import core, hub, outline, plane, workers
@@ -14,6 +15,70 @@ from . import core, hub, outline, plane, workers
 REPORT_CAP = 3500
 WIKI_TEXT_CAP = 6000
 DIFF_CAP = 30000
+DIFF_NOISE = ("*package-lock.json", "*pnpm-lock.yaml", "*yarn.lock", "*Cargo.lock", "*poetry.lock",
+              "*.min.js", "*.min.css", "*.map")
+
+ASYNC_BG = False  # включается в server.py: промежуточные plane.sync и hub.notify не тормозят ответы MCP
+_BG_LOCK = threading.Lock()
+_BG_PENDING: dict[str, list[bool]] = {}  # root -> [need_plane, need_hub]
+_BG_THREADS: dict[str, threading.Thread] = {}
+
+
+def _bg_worker(root: str) -> None:
+    while True:
+        with _BG_LOCK:
+            flags = _BG_PENDING.pop(root, None)
+            if not flags:
+                _BG_THREADS.pop(root, None)
+                return
+        do_plane, do_hub = flags
+        if do_plane:
+            try:
+                plane.sync(root)
+            except Exception:  # noqa: BLE001 — фоновый синк не должен ронять процесс
+                pass
+        if do_hub:
+            try:
+                plan = core.load(root, required=False)
+                if plan and hub.target(plan):
+                    hub.notify(plan, snapshot(root))
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _enqueue_bg(root: str, do_plane: bool = False, do_hub: bool = False) -> None:
+    with _BG_LOCK:
+        cur = _BG_PENDING.setdefault(root, [False, False])
+        cur[0] = cur[0] or do_plane
+        cur[1] = cur[1] or do_hub
+        t = _BG_THREADS.get(root)
+        if t is None or not t.is_alive():
+            t = threading.Thread(target=_bg_worker, args=(root,), daemon=True)
+            _BG_THREADS[root] = t
+            t.start()
+
+
+def flush_bg(root: str | None = None, timeout: float = 15.0) -> None:
+    """Дожидается фоновых синхронизаций Plane/Hub (перед finish и при завершении MCP-сервера)."""
+    deadline = time.monotonic() + max(0.1, timeout)
+    while True:
+        with _BG_LOCK:
+            threads = ([_BG_THREADS[root]] if root in _BG_THREADS else []) if root else list(_BG_THREADS.values())
+        threads = [t for t in threads if t.is_alive()]
+        if not threads or time.monotonic() >= deadline:
+            return
+        for t in threads:
+            t.join(timeout=max(0.05, deadline - time.monotonic()))
+
+
+def _sync_plane(root: str, force_sync: bool = False) -> str:
+    """Синхронизирует с Plane: в MCP-сервере промежуточные PATCH уходят в фон, если задача уже создана."""
+    if not force_sync and ASYNC_BG:
+        plan = core.load(root, required=False)
+        if plan and (plan.get("plane") or {}).get("issue_id"):
+            _enqueue_bg(root, do_plane=True)
+            return ""
+    return plane.sync(root)
 
 
 # ───────────────────────── подсказка следующего шага ─────────────────────────
@@ -67,9 +132,13 @@ def next_hint(root: str, plan: dict) -> str:
     return "Дальше: " + ("; ".join(parts) if parts else "добавь пункты plan_update(add=[...]).")
 
 
-def _tail(root: str, extra: str = "") -> str:
+def _tail(root: str, extra: str = "", sync_hub: bool = False) -> str:
     plan = core.load(root)
-    hub.notify(plan, snapshot(root) if hub.target(plan) else None)
+    if ASYNC_BG and not sync_hub:
+        if hub.target(plan):
+            _enqueue_bg(root, do_hub=True)
+    else:
+        hub.notify(plan, snapshot(root) if hub.target(plan) else None)
     return "\n".join(x for x in (extra, "План: " + core.status_line(plan), next_hint(root, plan)) if x)
 
 
@@ -108,7 +177,7 @@ def update(project_dir: str, add=None, changes=None, hold=None, title=None, goal
     plan = core.update(root, add=add, changes=changes, hold=hold, title=title, goal=goal, remove=remove,
                        user_approval=user_approval, branch=branch, deploy=deploy, deploy_quote=deploy_quote)
     notes = [f"Замечание: {n}" for n in core.advice(plan)] if add or changes or remove else []
-    return _tail(root, "\n".join(["План обновлён.", *notes, plane.sync(root)]).strip())
+    return _tail(root, "\n".join(x for x in ("План обновлён.", *notes, _sync_plane(root)) if x).strip())
 
 
 def show(project_dir: str, item_id=None) -> str:
@@ -133,7 +202,7 @@ def skip(project_dir: str, item_id, reason: str, user_approval: str, item_ids=No
             workers.kill(root, job, "пункт закрыт решением пользователя")
     core.skip(root, ids, reason, user_approval, outcome)
     what = "приняты пользователем без проверки" if outcome == "done" else "пропущены"
-    return _tail(root, f"Пункты {', '.join(ids)}: {what}. {plane.sync(root)}".strip())
+    return _tail(root, f"Пункты {', '.join(ids)}: {what}. {_sync_plane(root)}".strip())
 
 
 # ───────────────────────── исполнение ─────────────────────────
@@ -171,9 +240,9 @@ def _finished_report(root: str, jobs: list[dict]) -> list[str]:
     return lines
 
 
-def _escalate(root: str, finished: list[dict]) -> list[str]:
+def _escalate(root: str, finished: list[dict]) -> tuple[list[str], set[str]]:
     """Пункт на младшей модели не прошёл проверки — без участия оркестратора перезапускается ярусом выше."""
-    lines = []
+    lines, escalated = [], set()
     for job in finished:
         if job["kind"] != "item" or job["status"] != "FAILED" or "BLOCKED" in str(job.get("reason", "")):
             continue
@@ -188,9 +257,10 @@ def _escalate(root: str, finished: list[dict]) -> list[str]:
                  "их и доведи:\n" + core.fail_report(item, ev, 800)) if ev and not ev["passed"] else ""
         try:
             lines.append(f"Пункт {item['id']}: {was} не справился — повышен: " + _start_item(root, plan, item, True, carry))
+            escalated.add(job["id"])
         except core.PlanError as exc:
             lines.append(f"Пункт {item['id']}: повышен до {up}, старт отложен ({exc}) — plan_run(item_ids=[\"{item['id']}\"]).")
-    return lines
+    return lines, escalated
 
 
 def run(project_dir: str, item_ids=None, wait: bool | None = None, timeout: int = 600, fresh: bool = False,
@@ -200,38 +270,71 @@ def run(project_dir: str, item_ids=None, wait: bool | None = None, timeout: int 
     if plan["status"] == "finished":
         raise core.PlanError("План закрыт. Новая работа — plan_init или plan_update(add=[...]).")
     explicit = [str(i) for i in item_ids] if item_ids else None
-    targets = [core.find(plan, i) for i in explicit] if explicit else core.ready_items(plan)
-    started, refused = [], []
-    for item in targets:
+    deadline = time.time() + max(1, timeout)
+    started, refused, reports, escalations = [], [], [], []
+    any_finished = False
+    first_round = True
+
+    while True:
         plan = core.load(root)
-        item = core.find(plan, item["id"])
-        gate = core.start_gate(plan, item)
-        if gate:
-            refused.append(f"{item['id']}: {gate}")
-            continue
-        try:
-            started.append(_start_item(root, plan, item, fresh))
-        except core.PlanError as exc:
-            refused.append(f"{item['id']}: {exc}")
-    before = {j["id"] for j in workers.active_jobs(root)}
-    finished = []
-    if wait is None:  # свои пункты main оркестратор делает параллельно с воркерами, а не после них
-        wait = not any(i["status"] == "in_progress" and i["tier"] == "main" for i in core.load(root)["items"])
-    if wait and before:
-        jobs = workers.wait(root, sorted(before), "any", timeout, progress)
+        if first_round:
+            targets = [core.find(plan, i) for i in explicit] if explicit else core.ready_items(plan)
+            first_round = False
+        else:
+            targets = [] if explicit else [i for i in core.ready_items(plan) if i["tier"] != "main" and not i.get("light")]
+        for item in targets:
+            plan = core.load(root)
+            item = core.find(plan, item["id"])
+            gate = core.start_gate(plan, item)
+            if gate:
+                refused.append(f"{item['id']}: {gate}")
+                continue
+            try:
+                started.append(_start_item(root, plan, item, fresh))
+            except core.PlanError as exc:
+                refused.append(f"{item['id']}: {exc}")
+        active = workers.active_jobs(root)
+        plan = core.load(root)
+        has_main = any(i["status"] == "in_progress" and i["tier"] == "main" for i in plan["items"])
+        should_wait = (not has_main) if wait is None else bool(wait)
+        if not should_wait or not active:
+            break
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        jobs = workers.wait(root, sorted(j["id"] for j in active), "any", remaining, progress)
         finished = [j for j in jobs if j["status"] not in workers.ACTIVE]
+        if not finished:
+            break
+        any_finished = True
+        reports += _finished_report(root, finished)
+        esc_lines, escalated = _escalate(root, finished)
+        escalations += esc_lines
+        # Выходим к оркестратору, если есть неэскалированный провал или появились его пункты main/light.
+        hard_fail = any(j["kind"] == "item" and j["status"] != "DONE" and j["id"] not in escalated for j in finished)
+        if hard_fail:
+            break
+        plan = core.load(root)
+        ready = core.ready_items(plan)
+        if any(i["tier"] == "main" or i.get("light") for i in ready):
+            break
+        if not workers.active_jobs(root) and (explicit or not any(i["tier"] != "main" and not i.get("light") for i in ready)):
+            break
+
     out = []
     if started:
         out.append("Запущено: " + "; ".join(started))
     if refused:
         out.append("Не запущено: " + "; ".join(refused))
-    out += _finished_report(root, finished)
-    out += _escalate(root, finished)
+    out += reports
+    out += escalations
     live = [workers.view(j) for j in workers.active_jobs(root)]
     if live:
         out.append("Работают:\n" + workers.table(live))
-    if finished:
-        out.append(plane.sync(root))
+    if any_finished:
+        sync = _sync_plane(root)
+        if sync:
+            out.append(sync)
     return _tail(root, "\n".join(x for x in out if x))
 
 
@@ -247,7 +350,8 @@ def jobs(project_dir: str, wait: bool = False, mode: str = "any", timeout: int =
     recent = [j for j in workers.list_jobs(root) if j["status"] in workers.ACTIVE or j["id"] in watched
               or time.time() - j.get("ended", 0) < 900]
     has_plan = core.load(root, required=False) is not None
-    out = _finished_report(root, finished) + (_escalate(root, finished) if has_plan else [])
+    esc_lines = _escalate(root, finished)[0] if has_plan else []
+    out = _finished_report(root, finished) + esc_lines
     out.append(workers.table([workers.view(j) for j in recent[-10:]]))
     return _tail(root, "\n".join(out)) if has_plan else "\n".join(out)
 
@@ -272,7 +376,8 @@ def verify(project_dir: str, item_ids=None, note: str | None = None) -> str:
             lines.append(f"Пункт {item['id']}: закрыт без проверки ({core.LIGHT[item['light']]}) — {ev['note'][:160]}")
             continue
         lines.append(f"Пункт {item['id']}: PASS → done (лог {ev['log']})" if ev["passed"] else core.fail_report(item, ev))
-    return _tail(root, "\n".join(lines + [plane.sync(root)]).strip())
+    sync = _sync_plane(root)
+    return _tail(root, "\n".join(lines + ([sync] if sync else [])).strip())
 
 
 def worker_ctl(project_dir: str, action: str, ref, hint: str | None = None, full: bool = False) -> str:
@@ -355,7 +460,8 @@ def git_summary(root: str, base_rev: str, cap: int = DIFF_CAP) -> str:
     if not base_rev:
         return ""
     stat = _git(root, "diff", "--stat", base_rev, "--", ".", f":(exclude){core.DIR}")
-    diff = _git(root, "diff", base_rev, "--", ".", f":(exclude){core.DIR}")
+    excludes = [f":(exclude){core.DIR}", *(f":(exclude,glob){pat}" for pat in DIFF_NOISE)]
+    diff = _git(root, "diff", base_rev, "--", ".", *excludes)
     parts = []
     if stat.strip():
         parts.append("ИЗМЕНЕНО:\n" + stat.strip())
@@ -366,7 +472,9 @@ def git_summary(root: str, base_rev: str, cap: int = DIFF_CAP) -> str:
                                if len(diff) > budget else "") + ":\n" + cut)
         budget -= len(cut)
     new = [f for f in _git(root, "ls-files", "--others", "--exclude-standard").splitlines()
-           if f.strip() and "__pycache__/" not in f and "node_modules/" not in f and not f.endswith((".pyc", ".log"))]
+           if f.strip() and "__pycache__/" not in f and "node_modules/" not in f
+           and not f.endswith((".pyc", ".log", ".min.js", ".min.css", ".map"))
+           and os.path.basename(f) not in ("package-lock.json", "pnpm-lock.yaml", "yarn.lock", "Cargo.lock", "poetry.lock")]
     if new:
         parts.append("НОВЫЕ ФАЙЛЫ (вне git, читай сам): " + ", ".join(new[:40]))
         for rel in new[:12]:
@@ -472,7 +580,7 @@ def review(project_dir: str, wait: bool = True, timeout: int = 900, notes: str |
         (job,) = workers.wait(root, [job["id"]], "all", timeout, progress) or (job,)
         if job["status"] in workers.ACTIVE:
             return f"Приёмщик ещё работает ({job['id']}). Повтори plan_review() позже."
-    return _tail(root, _collect_review(root, job) + "\n" + plane.sync(root))
+    return _tail(root, "\n".join(x for x in (_collect_review(root, job), _sync_plane(root)) if x))
 
 
 def _outline():
@@ -677,6 +785,7 @@ def finish(project_dir: str, summary: str, user_approval: str | None = None, for
                 notes[str(j["item_id"])] = text if len(text) <= 2500 else text[:2500].rstrip() + "…"
     failed = core.write_report(root, notes)
     plan = core.load(root)
+    flush_bg(root)
     hub.notify(plan, snapshot(root) if hub.target(plan) else None)
     for job in jobs:
         workers.cleanup_session(job)

@@ -57,11 +57,44 @@ def _others_editing(job: dict) -> bool:
                for j in workers.list_jobs(job["root"]))
 
 
+def _dirty_snapshot(root: str) -> dict[str, tuple[int, int]] | None:
+    """Снимок изменённых/новых файлов git-дерева (mtime_ns, size) для отлова правок через Bash."""
+    try:
+        res = subprocess.run(["git", "-C", root, "status", "--porcelain", "-z", "-uall"],
+                             capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    snap: dict[str, tuple[int, int]] = {}
+    toks = res.stdout.split(b"\0")
+    i = 0
+    while i < len(toks) and toks[i]:
+        entry = toks[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        code = entry[:2]
+        rel = os.fsdecode(entry[3:])
+        if code[:1] in (b"R", b"C") and i < len(toks):
+            i += 1
+        if rel == core.DIR or rel.startswith(core.DIR + "/"):
+            continue
+        full = os.path.join(root, rel)
+        try:
+            st = os.lstat(full)
+            snap[rel] = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            snap[rel] = (-1, -1)
+    return snap
+
+
 def supervise(job: dict) -> None:
     root, item_id = job["root"], job.get("item_id")
     prompt, resume = job["prompt"], bool(job.get("resume"))
     while True:
         job = _update(job, status="RUNNING", pid=os.getpid())
+        before = _dirty_snapshot(root) if job["kind"] == "item" and not _others_editing(job) else None
         failure = run_claude(job, prompt, resume)
         tel = workers.telemetry(root, job["id"])
         if failure:
@@ -76,7 +109,13 @@ def supervise(job: dict) -> None:
             return
         plan = core.load(root)
         item = core.find(plan, item_id)
-        scope = workers.out_of_scope(item, tel["touched"])
+        touched = list(tel["touched"])
+        if before is not None and not _others_editing(job):
+            after = _dirty_snapshot(root) or {}
+            for rel, meta in after.items():
+                if before.get(rel) != meta and rel not in touched:
+                    touched.append(rel)
+        scope = workers.out_of_scope(item, touched, root=root)
         job = _update(job, out_of_scope=scope)
         if "STATUS: BLOCKED" in tel["text"].upper():
             _update(job, status="FAILED", reason="воркер сообщил BLOCKED", ended=time.time())

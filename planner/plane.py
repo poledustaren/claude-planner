@@ -14,10 +14,14 @@ import json
 import os
 import re
 import subprocess
+import time
 import urllib.error
 import urllib.request
 
 from . import core, projects
+
+_PROJECTS_CACHE: dict[tuple[str, str], tuple[float, list]] = {}
+PROJECTS_CACHE_TTL = 600.0
 
 CONFIG_FILES = ("~/.config/claude-planner/plane.env", "~/.config/agy-planner/plane.env")
 KEYS = ("PLANE_BASE_URL", "PLANE_API_KEY", "PLANE_WORKSPACE_SLUG")
@@ -284,7 +288,13 @@ def _norm(text: str) -> str:
 
 
 def _projects(cl: Client) -> list:
-    """Все проекты воркспейса: список в Plane постраничный."""
+    """Все проекты воркспейса: список в Plane постраничный (кэшируется в процессе на PROJECTS_CACHE_TTL)."""
+    use_cache = FACTORY is None and cl.transport == cl._http
+    key = (cl.base_url, cl.workspace)
+    if use_cache:
+        cached = _PROJECTS_CACHE.get(key)
+        if cached and time.monotonic() - cached[0] < PROJECTS_CACHE_TTL:
+            return list(cached[1])
     out, cursor = [], ""
     for _ in range(20):
         resp = cl.call("GET", cl.ws("projects/?per_page=100" + (f"&cursor={cursor}" if cursor else "")))
@@ -292,6 +302,8 @@ def _projects(cl: Client) -> list:
         if not (isinstance(resp, dict) and resp.get("next_page_results") and resp.get("next_cursor")):
             break
         cursor = str(resp["next_cursor"])
+    if use_cache:
+        _PROJECTS_CACHE[key] = (time.monotonic(), list(out))
     return out
 
 
@@ -333,6 +345,7 @@ def _create_project(cl: Client, name: str, root: str, meta: dict, existing: list
                                                 "cycle_view": True, "issue_views_view": True}) or {}
     if not made.get("id"):
         raise PlaneError("Plane не вернул id созданного проекта")
+    _PROJECTS_CACHE.pop((cl.base_url, cl.workspace), None)
     return made
 
 
@@ -504,7 +517,11 @@ def sync(root: str, extra: dict | None = None) -> str:
         state = states.get("in_review") if finished else states.get("in_progress") or states.get("todo")
         if state:
             payload["state"] = str(state)
+        digest = hashlib.sha1(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
         if info.get("issue_id"):
+            if info.get("issue_sync_sha1") == digest and info.get("page_url") == page_url:
+                return f"Plane: {info.get('issue_key') or ident} ({info.get('state') or ('В проверке' if finished else 'In Progress')}) {info.get('issue_url') or ''}".strip() \
+                       + (f" | паспорт: {page_url}" if page_url else "") + page_note
             issue = cl.call("PATCH", cl.ws(f"projects/{issue_project}/work-items/{info['issue_id']}/"), payload) or {}
         else:
             # в «Новых» хаб запускает задачи исполнителя сам: исполнителя ставим только задаче, которая уже в работе
@@ -519,7 +536,7 @@ def sync(root: str, extra: dict | None = None) -> str:
         key = info.get("adopted_key") or (f"{ident}-{seq}" if seq else ident)
         info.update(project_id=issue_project, sequence_id=seq, issue_key=key,
                     issue_url=f"{cl.base_url}/{cl.workspace}/projects/{issue_project}/issues/{info['issue_id']}",
-                    page_url=page_url, state="В проверке" if finished else "In Progress")
+                    page_url=page_url, state="В проверке" if finished else "In Progress", issue_sync_sha1=digest)
         with core.locked(root):
             fresh = core.load(root)
             fresh["plane"] = info

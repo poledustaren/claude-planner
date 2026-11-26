@@ -46,24 +46,24 @@ MCP-планер для Claude Code: план с детерминированн�
 
 ## Тиры
 
-| Тир | Модель | Права | Когда |
-|---|---|---|---|
-| `scout` (`plan_scout`) | Haiku | только чтение | разведка до планирования |
-| `code-mini` | Haiku | правка | механика по образцу в нескольких местах: переименование, однотипные правки. Не прошёл проверки после доработки — пункт сам перезапускается на `code-low` |
-| `code-low` | Sonnet, effort low | правка | простая реализация по образцу |
-| `code` | Sonnet, effort medium | правка | обычная реализация и багфикс |
-| `code-high` | Sonnet, effort high | правка | ветвистое, кросс-модульное |
-| `review` (`plan_review`) | Opus, effort medium | только чтение | приёмка по диффу |
-| `docs` (`wiki_publish`) | Haiku | только чтение | страница документации по материалам плана |
-| `main` | сам оркестратор | — | общие файлы, рискованное |
+| Тир | Модель | Права | Бюджет | Когда |
+|---|---|---|---|---|
+| `scout` (`plan_scout`) | Haiku | только чтение | `$0.25` | разведка до планирования |
+| `code-mini` | Haiku | правка | `$0.35` | механика по образцу. Не прошёл проверки — сам перезапускается на `code-low` |
+| `code-low` | Sonnet, effort low | правка | `$0.60` | типовая реализация (по умолчанию). Не прошёл — сам уходит на `code` |
+| `code` | Sonnet, effort medium | правка | `$1.50` | нетривиальная реализация и багфикс |
+| `code-high` | Sonnet, effort high | правка | `$3.00` | ветвистое, кросс-модульное |
+| `review` (`plan_review`) | Opus, effort medium | только чтение | `$1.50` | приёмка по диффу |
+| `docs` (`wiki_publish`) | Haiku | только чтение | `$0.30` | страница документации по материалам плана |
+| `main` | сам оркестратор | — | — | общие файлы, рискованное |
 
-Модель, effort и таймаут тира переопределяются в `~/.config/claude-planner/config.json`:
+Модель, effort, бюджет (`--max-budget-usd`) и таймаут тира переопределяются в `~/.config/claude-planner/config.json`:
 
 ```json
-{"tiers": {"code": {"model": "claude-sonnet-5", "effort": "low"}, "review": {"model": "sonnet", "effort": "high"}}}
+{"tiers": {"code": {"model": "claude-sonnet-5", "effort": "low", "budget": 1.0}, "review": {"model": "sonnet", "effort": "high"}}}
 ```
 
-Воркерам запрещены `git commit/push/reset/checkout/stash`, `sudo`, `ssh`, `docker`, установка пакетов; читающим тирам доступен только перечень читающих команд.
+Воркерам передаются `--disable-slash-commands` и `--no-chrome` (одноразовым `scout`/`review`/`docs` ещё и `--no-session-persistence`), запрещены `git commit/push/reset/checkout/stash`, мутирующие `git branch`, `sudo`, `ssh`, опасные `docker`-команды (`docker run --rm` для тестов разрешён), установка пакетов; читающим тирам доступен перечень читающих команд.
 
 ## Инструменты (11)
 

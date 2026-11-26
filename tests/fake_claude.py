@@ -18,11 +18,15 @@ cwd = os.getcwd()
 with open(os.path.join(cwd, ".fake.json"), encoding="utf-8") as fh:
     scenario = json.load(fh)
 resume = opt("--resume")
-sid = resume or opt("--session-id")
+sid = resume or opt("--session-id") or "ephemeral"
 memo_path = os.path.join(cwd, ".fake_sessions.json")
 memo = json.load(open(memo_path)) if os.path.exists(memo_path) else {}
 with open(os.path.join(cwd, ".fake_calls.jsonl"), "a", encoding="utf-8") as fh:
     fh.write(json.dumps({"sid": sid, "resume": bool(resume), "model": opt("--model"), "effort": opt("--effort"),
+                         "budget": opt("--max-budget-usd"),
+                         "no_slash": "--disable-slash-commands" in args,
+                         "no_chrome": "--no-chrome" in args,
+                         "ephemeral": "--no-session-persistence" in args,
                          "tools": opt("--tools"), "prompt": prompt, "worker": os.environ.get("CPLAN_WORKER"),
                          "leak": os.environ.get("CLAUDECODE")}, ensure_ascii=False) + "\n")
 
@@ -67,6 +71,16 @@ for op in ops:
         emit({"type": "assistant", "message": {"id": f"m{n}", "usage": {"input_tokens": 10, "cache_read_input_tokens": 5000,
               "output_tokens": 20}, "content": [{"type": "tool_use", "id": f"t{n}", "name": "Write",
                                                  "input": {"file_path": path}}]}})
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(op[2])
+    elif op[0] == "bash_write":
+        # Имитация записи через Bash (без tool_use Write/Edit) для проверки отлова out_of_scope по git status
+        n += 1
+        path = os.path.join(cwd, op[1])
+        emit({"type": "assistant", "message": {"id": f"m{n}", "usage": {"input_tokens": 10, "cache_read_input_tokens": 5000,
+              "output_tokens": 20}, "content": [{"type": "tool_use", "id": f"t{n}", "name": "Bash",
+                                                 "input": {"command": f"echo > {op[1]}"}}]}})
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(op[2])

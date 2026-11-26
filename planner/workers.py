@@ -24,22 +24,28 @@ CONFIG_FILE = "~/.config/claude-planner/config.json"
 MAX_PARALLEL = 4
 MAX_FIX_ROUNDS = 1
 DEFAULT_TIERS = {
-    "scout": {"model": "haiku", "effort": None, "mode": "read", "timeout": 300},
-    "code-mini": {"model": "haiku", "effort": None, "mode": "edit", "timeout": 600},
-    "code-low": {"model": "sonnet", "effort": "low", "mode": "edit", "timeout": 900},
-    "code": {"model": "sonnet", "effort": "medium", "mode": "edit", "timeout": 1500},
-    "code-high": {"model": "sonnet", "effort": "high", "mode": "edit", "timeout": 2400},
-    "review": {"model": "opus", "effort": "medium", "mode": "read", "timeout": 900},
-    "docs": {"model": "haiku", "effort": None, "mode": "read", "timeout": 600},
+    "scout": {"model": "haiku", "effort": None, "mode": "read", "timeout": 300, "budget": 0.25},
+    "code-mini": {"model": "haiku", "effort": None, "mode": "edit", "timeout": 600, "budget": 0.35},
+    "code-low": {"model": "sonnet", "effort": "low", "mode": "edit", "timeout": 900, "budget": 0.60},
+    "code": {"model": "sonnet", "effort": "medium", "mode": "edit", "timeout": 1500, "budget": 1.50},
+    "code-high": {"model": "sonnet", "effort": "high", "mode": "edit", "timeout": 2400, "budget": 3.00},
+    "review": {"model": "opus", "effort": "medium", "mode": "read", "timeout": 900, "budget": 1.50},
+    "docs": {"model": "haiku", "effort": None, "mode": "read", "timeout": 600, "budget": 0.30},
 }
+EPHEMERAL_KINDS = ("scout", "review", "docs")
 ACTIVE = ("QUEUED", "RUNNING", "VERIFYING", "VERIFY_WAIT")
 EDITING = ("QUEUED", "RUNNING")
 READ_BASH = ("rg", "fd", "ls", "wc", "bat", "cat", "head", "tail", "sed -n", "tree", "stat", "file", "jq",
-             "ast-grep", "codegraph", "git log", "git diff", "git show", "git status", "git blame",
-             "git ls-files", "git grep", "git rev-parse")
-DENY_BASH = ("git commit", "git push", "git reset", "git checkout", "git switch", "git branch", "git worktree",
+             "dirname", "basename", "realpath", "ast-grep", "codegraph", "git log", "git diff", "git show",
+             "git status", "git blame", "git ls-files", "git grep", "git rev-parse", "git merge-base",
+             "git branch --show-current", "git branch -a")
+DENY_BASH = ("git commit", "git push", "git reset", "git checkout", "git switch", "git worktree",
+             "git branch -d", "git branch -D", "git branch -m", "git branch -M", "git branch -c", "git branch -C",
+             "git branch --delete", "git branch --move", "git branch --copy",
              "git restore", "git stash", "git clean",
-             "git rebase", "git merge", "sudo", "ssh", "scp", "rsync", "systemctl", "docker", "kubectl",
+             "git rebase", "git merge", "sudo", "ssh", "scp", "rsync", "systemctl", "kubectl",
+             "docker push", "docker rm", "docker rmi", "docker stop", "docker kill", "docker system",
+             "docker compose up", "docker compose down", "docker compose restart",
              "pip install", "npm install", "apt", "pkill", "killall")
 SCRUB_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION",
              "CLAUDE_PID", "CLAUDE_JOB_DIR", "CLAUDE_EFFORT", "CLAUDE_CODE_MESSAGING_SOCKET",
@@ -51,8 +57,12 @@ COMMON_RULES = (
     "Пути, символы, флаги не выдумывай — подсматривай в файлах и выводе команд. "
     "Независимые вызовы инструментов делай пачкой в одном шаге. Вопросы пользователю и субагенты недоступны."
 )
+READ_BASH_RULE = (
+    " В Bash запускай по одной чистой команде без cd &&, ;, for и пайпов (иначе dontAsk отклонит); "
+    "поиск и чтение делай инструментами Grep/Glob/Read."
+)
 SYS_SCOUT = (
-    "Ты разведчик кода в проекте {root}. Только чтение. " + COMMON_RULES + "\n"
+    "Ты разведчик кода в проекте {root}. Только чтение. " + COMMON_RULES + READ_BASH_RULE + "\n"
     "Ответ — не длиннее 40 строк, без вступлений:\n"
     "1) ГДЕ: точные file:line и имена символов по вопросу.\n"
     "2) КАК УСТРОЕНО: 3–6 строк, только то, что нужно для правки.\n"
@@ -65,13 +75,14 @@ SYS_CODE = (
     "1) Делай ровно пункт, не расширяй задачу. Правь только файлы из списка; без другого файла не обойтись — "
     "закончи отчётом STATUS: BLOCKED с причиной.\n"
     "2) Минимальный дифф в стиле соседнего кода. Никаких заглушек, TODO и закомментированного кода.\n"
-    "3) Прогони проверки пункта сам и чини, пока не пройдут: после тебя их запустит приёмщик.\n"
+    "3) После правок прогони быструю локальную проверку своей области (линтер/сборка/узкий тест); "
+    "полный набор verify сразу после тебя запустит надзиратель и при провале вернёт лог.\n"
     "4) Запрещено: git commit/push/reset/checkout/stash, sudo, ssh, установка пакетов, правка чужих файлов.\n"
     "Финальный ответ — не длиннее 15 строк: первая строка «STATUS: DONE» или «STATUS: BLOCKED», затем "
     "изменённые места (file:line), какие проверки прогнал и с каким результатом, грабли."
 )
 SYS_REVIEW = (
-    "Ты приёмщик в проекте {root}: враждебно проверяешь выполненный план. Только чтение. " + COMMON_RULES + "\n"
+    "Ты приёмщик в проекте {root}: враждебно проверяешь выполненный план. Только чтение. " + COMMON_RULES + READ_BASH_RULE + "\n"
     "Зелёные проверки доказывают лишь то, что код не упал. Проверь по диффу и по коду: выполнена ли цель и "
     "критерий каждого пункта по существу, нет ли заглушек, сломанных соседних путей, забытых мест "
     "использования, правок вне задачи. Каждое замечание — с file:line, которое ты сам прочитал. "
@@ -82,7 +93,7 @@ SYS_REVIEW = (
 )
 SYS_DOCS = (
     "Ты технический писатель проекта {root}: пишешь страницу документации по закрытому плану. Только чтение. "
-    + COMMON_RULES + "\n"
+    + COMMON_RULES + READ_BASH_RULE + "\n"
     "1) Только факты из задания и из файлов, которые ты сам открыл. Не знаешь — не пиши, не домысливай.\n"
     "2) Утверждения об устройстве кода — со ссылкой file:line. Команды запуска и проверки бери из пунктов плана.\n"
     "3) Заметки оркестратора — решения и грабли из разговора с пользователем: включи их по смыслу, не теряй.\n"
@@ -113,7 +124,7 @@ def tiers() -> dict:
         with open(os.path.expanduser(CONFIG_FILE), encoding="utf-8") as fh:
             for name, patch in (json.load(fh).get("tiers") or {}).items():
                 if name in out and isinstance(patch, dict):
-                    out[name].update({k: v for k, v in patch.items() if k in ("model", "effort", "timeout")})
+                    out[name].update({k: v for k, v in patch.items() if k in ("model", "effort", "timeout", "budget")})
     except (OSError, ValueError):
         pass
     return out
@@ -144,10 +155,18 @@ def edit_rules(job: dict) -> list[str]:
 def build_cmd(job: dict, resume: bool) -> list[str]:
     tier = tiers()[job["tier"]]
     cmd = [claude_bin(), "-p", "--model", tier["model"], "--setting-sources", "", "--strict-mcp-config",
+           "--disable-slash-commands", "--no-chrome",
            "--output-format", "stream-json", "--verbose", "--permission-mode", "dontAsk"]
     if tier.get("effort"):
         cmd += ["--effort", tier["effort"]]
-    cmd += ["--resume", job["session_id"]] if resume else ["--session-id", job["session_id"]]
+    if tier.get("budget"):
+        cmd += ["--max-budget-usd", str(tier["budget"])]
+    if resume:
+        cmd += ["--resume", job["session_id"]]
+    elif job.get("kind") in EPHEMERAL_KINDS:
+        cmd += ["--no-session-persistence"]
+    else:
+        cmd += ["--session-id", job["session_id"]]
     if tier["mode"] == "read":
         cmd += ["--tools", "Read,Grep,Glob,Bash",
                 "--allowedTools", "Read", "Grep", "Glob", *[f"Bash({c}:*)" for c in READ_BASH]]
@@ -198,6 +217,35 @@ def hydrate(root: str, text: str, max_chars: int = 12000) -> str:
     return "\n".join(out)
 
 
+def hydrate_files(root: str, paths: list[str], max_lines: int = 150, max_chars: int = 6000) -> str:
+    """Если контекст не назвал file:L1-L2, вшивает небольшие существующие файлы пункта целиком."""
+    out, used = [], 0
+    for rel in list(dict.fromkeys(paths or [])):
+        if not rel or rel.endswith("/"):
+            continue
+        path = os.path.join(root, rel)
+        if not os.path.isfile(path):
+            continue
+        try:
+            if os.path.getsize(path) > 32_000:
+                continue
+            with open(path, "rb") as fh:
+                raw = fh.read()
+            if b"\0" in raw[:4096]:
+                continue
+            lines = raw.decode("utf-8", errors="replace").splitlines(keepends=True)
+        except OSError:
+            continue
+        if not lines or len(lines) > max_lines:
+            continue
+        block = f"--- {rel}:1-{len(lines)}\n" + "".join(f"{n}\t{ln}" for n, ln in enumerate(lines, 1))
+        if used + len(block) > max_chars:
+            break
+        used += len(block)
+        out.append(block.rstrip("\n"))
+    return "\n".join(out)
+
+
 def item_prompt(plan: dict, item: dict) -> str:
     root = plan["root"]
     parts = [f"ЦЕЛЬ ПЛАНА: {plan['goal']}", f"ПУНКТ {item['id']}: {item['title']}",
@@ -220,9 +268,9 @@ def item_prompt(plan: dict, item: dict) -> str:
                      + "; ".join(f"{f} ← {', '.join(u[:8])}" for f, u in users.items()))
     if item.get("context"):
         parts.append("КОНТЕКСТ: " + item["context"])
-        slices = hydrate(root, item["context"])
-        if slices:
-            parts.append("СРЕЗЫ КОДА (актуальны на момент старта, номера строк слева):\n" + slices)
+    slices = hydrate(root, item.get("context") or "") or hydrate_files(root, core.file_paths(item))
+    if slices:
+        parts.append("СРЕЗЫ КОДА (актуальны на момент старта, номера строк слева):\n" + slices)
     return "\n\n".join(parts)
 
 
@@ -376,65 +424,136 @@ def stream_path(root: str, job_id: str) -> str:
     return os.path.join(jobs_dir(root), job_id, "stream.jsonl")
 
 
+def _telemetry_cache_path(root: str, job_id: str) -> str:
+    return os.path.join(jobs_dir(root), job_id, "telemetry.json")
+
+
 def _brief(name: str, inp: dict) -> str:
     val = inp.get("file_path") or inp.get("command") or inp.get("pattern") or inp.get("path") or ""
     return f"{name} {str(val).replace(chr(10), ' ')[:90]}".strip()
 
 
-def telemetry(root: str, job_id: str, trail: int = 0) -> dict:
-    t = {"steps": 0, "last": "", "out_tokens": 0, "ctx": 0, "touched": [], "text": "", "structured": None,
-         "cost": 0.0, "turns": 0, "finished": False, "is_error": False, "denials": 0, "trail": []}
-    touched, seen = [], set()
+_TRAIL_CAP = 250
+
+
+def _empty_tel() -> dict:
+    return {"v": 1, "offset": 0, "steps": 0, "last": "", "out_tokens": 0, "ctx": 0, "touched": [], "text": "",
+            "structured": None, "cost": 0.0, "turns": 0, "finished": False, "is_error": False, "denials": 0,
+            "trail": [], "seen": []}
+
+
+def _consume_line(st: dict, seen: set, line: str) -> None:
     try:
-        fh = open(stream_path(root, job_id), encoding="utf-8", errors="replace")
-    except OSError:
-        return t
-    with fh:
-        for line in fh:
-            try:
-                d = json.loads(line)
-            except ValueError:
+        d = json.loads(line)
+    except ValueError:
+        return
+    kind = d.get("type")
+    if kind == "assistant":
+        msg = d.get("message") or {}
+        u = msg.get("usage") or {}
+        mid = msg.get("id")
+        if mid not in seen:
+            seen.add(mid)
+            if mid is not None:
+                st["seen"].append(mid)
+            st["out_tokens"] += u.get("output_tokens") or 0
+            st["ctx"] = max(st["ctx"], sum(u.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens",
+                                                                   "cache_creation_input_tokens")))
+        for b in msg.get("content") or []:
+            if not isinstance(b, dict):
                 continue
-            kind = d.get("type")
-            if kind == "assistant":
-                msg = d.get("message") or {}
-                u = msg.get("usage") or {}
-                if msg.get("id") not in seen:
-                    seen.add(msg.get("id"))
-                    t["out_tokens"] += u.get("output_tokens") or 0
-                    t["ctx"] = max(t["ctx"], sum(u.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens",
-                                                                         "cache_creation_input_tokens")))
-                for b in msg.get("content") or []:
-                    if not isinstance(b, dict):
-                        continue
-                    if b.get("type") == "tool_use":
-                        t["steps"] += 1
-                        t["last"] = _brief(b.get("name", ""), b.get("input") or {})
-                        t["trail"].append(t["last"])
-                        fp = (b.get("input") or {}).get("file_path")
-                        if b.get("name") in ("Edit", "Write") and fp and fp not in touched:
-                            touched.append(fp)
-                    elif b.get("type") == "text" and b.get("text", "").strip():
-                        t["text"] = b["text"].strip()
-                t["finished"] = False
-            elif kind == "result":
-                t["finished"] = True
-                t["is_error"] = bool(d.get("is_error")) or d.get("subtype") != "success"
-                t["cost"] = max(t["cost"], d.get("total_cost_usd") or 0.0)
-                t["turns"] += d.get("num_turns") or 0
-                t["denials"] += len(d.get("permission_denials") or [])
-                if isinstance(d.get("result"), str) and d["result"].strip():
-                    t["text"] = d["result"].strip()
-                if d.get("structured_output") is not None:
-                    t["structured"] = d["structured_output"]
-    t["touched"] = [os.path.relpath(p, root) if p.startswith(root + os.sep) else p for p in touched]
-    t["trail"] = t["trail"][-trail:] if trail else []
-    return t
+            if b.get("type") == "tool_use":
+                st["steps"] += 1
+                st["last"] = _brief(b.get("name", ""), b.get("input") or {})
+                st["trail"].append(st["last"])
+                fp = (b.get("input") or {}).get("file_path")
+                if b.get("name") in ("Edit", "Write") and fp and fp not in st["touched"]:
+                    st["touched"].append(fp)
+            elif b.get("type") == "text" and b.get("text", "").strip():
+                st["text"] = b["text"].strip()
+        st["finished"] = False
+    elif kind == "result":
+        st["finished"] = True
+        st["is_error"] = bool(d.get("is_error")) or d.get("subtype") != "success"
+        st["cost"] = max(st["cost"], d.get("total_cost_usd") or 0.0)
+        st["turns"] += d.get("num_turns") or 0
+        st["denials"] += len(d.get("permission_denials") or [])
+        if isinstance(d.get("result"), str) and d["result"].strip():
+            st["text"] = d["result"].strip()
+        if d.get("structured_output") is not None:
+            st["structured"] = d["structured_output"]
 
 
-def out_of_scope(item: dict, touched: list[str]) -> list[str]:
-    allowed = set(core.file_paths(item))
-    return [p for p in touched if p not in allowed] if allowed else []
+def telemetry(root: str, job_id: str, trail: int = 0) -> dict:
+    """Инкрементально читает stream.jsonl: хранит байт-позицию в telemetry.json и дочитывает только хвост."""
+    sp = stream_path(root, job_id)
+    cp = _telemetry_cache_path(root, job_id)
+    try:
+        size = os.path.getsize(sp)
+    except OSError:
+        st = _empty_tel()
+        return {k: st[k] for k in st if k not in ("v", "offset", "seen")}
+    st = None
+    try:
+        with open(cp, encoding="utf-8") as fh:
+            cached = json.load(fh)
+        if isinstance(cached, dict) and cached.get("v") == 1 and 0 <= int(cached.get("offset", -1)) <= size:
+            st = cached
+    except (OSError, ValueError, TypeError):
+        st = None
+    if st is None:
+        st = _empty_tel()
+    offset = int(st.get("offset") or 0)
+    if size > offset:
+        seen = set(st.get("seen") or [])
+        try:
+            with open(sp, "rb") as fh:
+                fh.seek(offset)
+                pos = offset
+                while True:
+                    raw = fh.readline()
+                    if not raw or not raw.endswith(b"\n"):
+                        break
+                    pos += len(raw)
+                    _consume_line(st, seen, raw.decode("utf-8", errors="replace"))
+            if pos > offset:
+                st["offset"] = pos
+                if len(st["trail"]) > _TRAIL_CAP:
+                    st["trail"] = st["trail"][-_TRAIL_CAP:]
+                if len(st["seen"]) > 2000:
+                    st["seen"] = st["seen"][-2000:]
+                try:
+                    core.atomic_write(cp, json.dumps(st, ensure_ascii=False))
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    touched = [os.path.relpath(p, root) if p.startswith(root + os.sep) else p for p in st["touched"]]
+    out = {k: st[k] for k in st if k not in ("v", "offset", "seen")}
+    out["touched"] = touched
+    out["trail"] = st["trail"][-trail:] if trail else []
+    return out
+
+
+def _in_scope(rel: str, allowed: list[str], root: str | None = None) -> bool:
+    while rel.startswith("./"):
+        rel = rel[2:]
+    for pat in allowed:
+        while pat.startswith("./"):
+            pat = pat[2:]
+        if pat.endswith("/"):
+            if rel.startswith(pat):
+                return True
+        elif rel == pat:
+            return True
+        elif root and os.path.isdir(os.path.join(root, pat)) and rel.startswith(pat + "/"):
+            return True
+    return False
+
+
+def out_of_scope(item: dict, touched: list[str], root: str | None = None) -> list[str]:
+    allowed = core.file_paths(item)
+    return [p for p in touched if not _in_scope(p, allowed, root)] if allowed else []
 
 
 def view(job: dict, trail: int = 0) -> dict:
